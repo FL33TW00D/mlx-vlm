@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -40,6 +40,31 @@ class TextConfig:
         )
 
 
+class Gemma3p5EinsumLayer(nn.Module):
+    def __init__(
+        self,
+        shape: Sequence[int],
+        einsum_str: str,
+        *args,
+        weight_init: Optional[Callable[..., mx.array]] = None,
+        **kwargs,
+    ):
+        if "->" not in einsum_str:
+            raise ValueError("Einsum must contain '->'")
+
+        if len(einsum_str.split("->")[0].split(",")) != 2:
+            raise ValueError("Need to have exactly two inputs in einsum instruction")
+
+        super().__init__(*args, **kwargs)
+        self.shape = shape
+        self.einsum_str = einsum_str
+
+        self.weight = mx.ones(shape)
+
+    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
+        return mx.einsum(self.einsum_str, x, self.weight)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1e-5):
         super().__init__()
@@ -48,6 +73,34 @@ class RMSNorm(nn.Module):
 
     def __call__(self, x):
         return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+
+
+class Gemma3p5LaurelBlock(nn.Module):
+    """Learned Augmented Residual Layer"""
+
+    def __init__(self, config: TextConfig, *args, **kwargs):
+        super().__init__()
+        self.config = config
+
+        self.linear_left = Gemma3p5EinsumLayer(
+            shape=(self.config.hidden_size, self.config.laurel_rank),
+            einsum_str="bld,dr->blr",
+        )
+        self.linear_right = Gemma3p5EinsumLayer(
+            shape=(self.config.laurel_rank, self.config.hidden_size),
+            einsum_str="blr,rd->bld",
+        )
+        self.post_laurel_norm = RMSNorm(
+            dims=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+        )
+
+    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
+        laurel_x = self.linear_left(x)
+        laurel_x = self.linear_right(laurel_x)
+        normed_laurel_x = self.post_laurel_norm(laurel_x)
+        x = x + normed_laurel_x
+        return x
 
 
 class Attention(nn.Module):
@@ -82,6 +135,20 @@ class Attention(nn.Module):
             ),
         )
 
+        self.q_norm = RMSNorm(
+            dims=config.head_dim,
+            eps=config.rms_norm_eps,
+        )
+        self.k_norm = RMSNorm(
+            dims=config.head_dim,
+            eps=config.rms_norm_eps,
+        )
+
+        self.v_norm = RMSNorm(
+            dims=config.head_dim,
+            eps=config.rms_norm_eps,
+        )
+
     def __call__(
         self,
         x: mx.array,
@@ -106,6 +173,10 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        queries = self.q_norm(queries)
+        keys = self.k_norm(keys)
+        values = self.v_norm(values)
+
         # Sliding window
         if mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
@@ -119,17 +190,148 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, config: TextConfig, layer_idx: int = 0, *args, **kwargs):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.GELU()
+        if config.activation_sparsity_pattern is not None:
+            self.activation_sparsity = config.activation_sparsity_pattern[layer_idx]
+        else:
+            self.activation_sparsity = 0.0
 
-    def __call__(self, x) -> mx.array:
-        # This should not be GELU approx, jax.nn.gelu
-        return self.down_proj(nn.gelu_approx(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x: mx.array):
+        gate_proj = self.gate_proj(x)
+        if self.activation_sparsity > 0.0:
+            gate_proj = self._gaussian_topk(gate_proj)
+        activations = self.act_fn(gate_proj)
+        up_proj = self.up_proj(x)
+        down_proj = self.down_proj(activations * up_proj)
+        return down_proj
+
+    def _gaussian_topk(self,inputs: mx.array) -> mx.array:
+        # Calculate the cutoff value based on the target sparsity
+        # For normal distribution, we use the inverse CDF (quantile function)
+        # Convert to numpy, calculate the quantile, then back to mx.array
+        # Use numpy's special functions instead of scipy
+        if self.activation_sparsity <= 0.0:
+            # For 0 sparsity, return infinity to match PyTorch behavior
+            # This will make all values pass through
+            inf_value = mx.array(float('inf'))
+            return mx.broadcast_to(inf_value, inputs.shape)
+
+        normal_dist = mx.random.normal((1,))
+
+        # Generate a large sample from normal distribution
+        sample_size = 100000
+        normal_samples = mx.random.normal(shape=(sample_size,))
+
+        # Sort the samples
+        sorted_samples = mx.sort(normal_samples)
+
+        # Find the index corresponding to our target sparsity
+        idx = int(self.activation_sparsity * sample_size)
+
+        # Get the value at that index as our std_multiplier
+        std_multiplier = float(sorted_samples[idx]) if idx < sample_size else 0.0
+
+        # Calculate mean and standard deviation along the last dimension
+        inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
+        inputs_std = mx.std(inputs, axis=-1, keepdims=True)
+
+        # Calculate the cutoff threshold
+        cutoff_x = inputs_mean + inputs_std * std_multiplier
+
+        # Apply ReLU to zero out values below the cutoff
+        return mx.maximum(0, inputs - cutoff_x)
 
 
+
+class Gemma3p5AltUp(nn.Module):
+    """Alternating Updates (AltUp)
+
+    The AltUp module wraps transformer layers. The `predict` step modifies the
+    input to the transformer layer, and the `correct` step propagates the output
+    of the transformer layer to the sparsely updated dimensions.
+
+    See more in the research paper:
+
+    https://proceedings.neurips.cc/paper_files/paper/2023/file/f2059277ac6ce66e7e5543001afa8bb5-Paper-Conference.pdf
+    """
+
+    def __init__(self, config: TextConfig, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+
+        self.correction_coefs = mx.zeros((self.config.altup_num_inputs, self.config.altup_num_inputs))
+        self.prediction_coefs = mx.zeros((self.config.altup_num_inputs, self.config.altup_num_inputs, self.config.altup_num_inputs))
+        self.modality_router = Gemma3p5EinsumLayer(
+            shape=(self.config.hidden_size, self.config.altup_num_inputs),
+            einsum_str="btf,fd->btd",
+        )
+        self.router_norm = RMSNorm(
+            dims=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+        )
+
+    def compute_router_modalities(self, x: mx.array) -> mx.array:
+        x_norm = self.router_norm(x)
+        router_inputs = x_norm * self.config.hidden_size**-1.0
+        routed: mx.array = self.modality_router(router_inputs)
+        modalities = mx.tanh(routed)
+        return modalities
+
+    def predict(self, x: Sequence[mx.array]) -> Sequence[mx.array]:
+        modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
+        prediction_coefs = self.prediction_coefs
+
+        if self.config.altup_coef_clip is not None:
+            prediction_coefs = mx.clip(prediction_coefs, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+
+        all_coefs = mx.einsum("...p,pij->...ij", modalities, prediction_coefs)
+
+        outputs: list[mx.array] = [mx.zeros_like(x[0])] * self.config.altup_num_inputs
+        for i in range(self.config.altup_num_inputs):
+            output = 0.0
+
+            for j in range(self.config.altup_num_inputs):
+                coef = mx.expand_dims(all_coefs[..., i, j], axis=-1)
+                output += coef * x[j]
+
+            x_i = x[i]
+            outputs[i] = (x_i + output).astype(x_i.dtype)
+
+        return outputs
+
+    def correct(self, predictions: Sequence[mx.array], activated: mx.array) -> Sequence[mx.array]:
+        modalities = self.compute_router_modalities(activated)
+        correction_coefs = self.correction_coefs.float()
+
+        if self.config.altup_coef_clip is not None:
+            correction_coefs = mx.clip(correction_coefs, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+
+        all_coefs = mx.einsum("...p,pi->...i", modalities, correction_coefs)
+
+        active_x = predictions[self.config.altup_active_idx]
+        innovation = activated - active_x
+
+        corrected = [mx.zeros_like(predictions[0])] * self.config.altup_num_inputs
+        for i in range(self.config.altup_num_inputs):
+            coef = mx.expand_dims(all_coefs[..., i] + 1, axis=-1)
+            corrected[i] = (predictions[i] + coef * innovation).astype(activated.dtype)
+
+        return corrected
+
+    def __call__(self, x: Sequence[mx.array], activated: mx.array, *args, **kwargs) -> Sequence[mx.array]:
+        predictions = self.predict(x, *args, **kwargs)
+        corrected = self.correct(predictions=predictions, activated=activated, *args, **kwargs)
+        return corrected
+
+# TODO
 class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
