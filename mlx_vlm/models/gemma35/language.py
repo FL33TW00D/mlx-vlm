@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Union, Callable, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -213,7 +213,7 @@ class MLP(nn.Module):
         down_proj = self.down_proj(activations * up_proj)
         return down_proj
 
-    def _gaussian_topk(self,inputs: mx.array) -> mx.array:
+    def _gaussian_topk(self, inputs: mx.array) -> mx.array:
         # Calculate the cutoff value based on the target sparsity
         # For normal distribution, we use the inverse CDF (quantile function)
         # Convert to numpy, calculate the quantile, then back to mx.array
@@ -221,7 +221,7 @@ class MLP(nn.Module):
         if self.activation_sparsity <= 0.0:
             # For 0 sparsity, return infinity to match PyTorch behavior
             # This will make all values pass through
-            inf_value = mx.array(float('inf'))
+            inf_value = mx.array(float("inf"))
             return mx.broadcast_to(inf_value, inputs.shape)
 
         normal_dist = mx.random.normal((1,))
@@ -250,7 +250,6 @@ class MLP(nn.Module):
         return mx.maximum(0, inputs - cutoff_x)
 
 
-
 class Gemma3p5AltUp(nn.Module):
     """Alternating Updates (AltUp)
 
@@ -267,8 +266,16 @@ class Gemma3p5AltUp(nn.Module):
         super().__init__(*args, **kwargs)
         self.config = config
 
-        self.correction_coefs = mx.zeros((self.config.altup_num_inputs, self.config.altup_num_inputs))
-        self.prediction_coefs = mx.zeros((self.config.altup_num_inputs, self.config.altup_num_inputs, self.config.altup_num_inputs))
+        self.correction_coefs = mx.zeros(
+            (self.config.altup_num_inputs, self.config.altup_num_inputs)
+        )
+        self.prediction_coefs = mx.zeros(
+            (
+                self.config.altup_num_inputs,
+                self.config.altup_num_inputs,
+                self.config.altup_num_inputs,
+            )
+        )
         self.modality_router = Gemma3p5EinsumLayer(
             shape=(self.config.hidden_size, self.config.altup_num_inputs),
             einsum_str="btf,fd->btd",
@@ -290,7 +297,11 @@ class Gemma3p5AltUp(nn.Module):
         prediction_coefs = self.prediction_coefs
 
         if self.config.altup_coef_clip is not None:
-            prediction_coefs = mx.clip(prediction_coefs, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+            prediction_coefs = mx.clip(
+                prediction_coefs,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip,
+            )
 
         all_coefs = mx.einsum("...p,pij->...ij", modalities, prediction_coefs)
 
@@ -307,12 +318,18 @@ class Gemma3p5AltUp(nn.Module):
 
         return outputs
 
-    def correct(self, predictions: Sequence[mx.array], activated: mx.array) -> Sequence[mx.array]:
+    def correct(
+        self, predictions: Sequence[mx.array], activated: mx.array
+    ) -> Sequence[mx.array]:
         modalities = self.compute_router_modalities(activated)
         correction_coefs = self.correction_coefs.float()
 
         if self.config.altup_coef_clip is not None:
-            correction_coefs = mx.clip(correction_coefs, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+            correction_coefs = mx.clip(
+                correction_coefs,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip,
+            )
 
         all_coefs = mx.einsum("...p,pi->...i", modalities, correction_coefs)
 
@@ -326,10 +343,15 @@ class Gemma3p5AltUp(nn.Module):
 
         return corrected
 
-    def __call__(self, x: Sequence[mx.array], activated: mx.array, *args, **kwargs) -> Sequence[mx.array]:
+    def __call__(
+        self, x: Sequence[mx.array], activated: mx.array, *args, **kwargs
+    ) -> Sequence[mx.array]:
         predictions = self.predict(x, *args, **kwargs)
-        corrected = self.correct(predictions=predictions, activated=activated, *args, **kwargs)
+        corrected = self.correct(
+            predictions=predictions, activated=activated, *args, **kwargs
+        )
         return corrected
+
 
 # TODO
 class TransformerBlock(nn.Module):
