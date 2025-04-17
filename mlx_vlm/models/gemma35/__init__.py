@@ -5,4 +5,6 @@ from .gemma35 import (
     TextConfig,
     VisionConfig,
     VisionModel,
+    AudioConfig,
+    AudioModel,
 )
