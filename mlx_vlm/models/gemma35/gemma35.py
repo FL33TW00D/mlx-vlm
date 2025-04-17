@@ -9,9 +9,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
+from .audio import AudioConfig, AudioModel
 from .language import LanguageModel, RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
-from .audio import AudioConfig, AudioModel
+
 
 @dataclass
 class ModelConfig:

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
-import mlx.nn as nn
 import mlx.core as mx
+import mlx.nn as nn
 
 
 @dataclass
@@ -21,7 +21,6 @@ class AudioConfig:
     sscp_conv_channel_size: tuple[int, int] = (128, 32)
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
-
 
 
 class Gemma3p5AudioSSCPConvBlock(nn.Module):
