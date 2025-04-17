@@ -11,7 +11,7 @@ from huggingface_hub import snapshot_download
 
 from .language import LanguageModel, RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
-
+from .audio import AudioConfig, AudioModel
 
 @dataclass
 class ModelConfig:
