@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from typing import Callable, Optional, OrderedDict, Tuple, Union 
+from collections.abc import Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -22,12 +24,199 @@ class AudioConfig:
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
 
+# (x: mx.array, mask: mx.BoolArray (no BoolArray in mlx))
+type SLSequence = Tuple[mx.array, mx.array] 
 
-class Gemma3p5AudioSSCPConvBlock(nn.Module):
+class SequenceLayer(nn.Module):
+    layers: Callable[[SLSequence], SLSequence]
 
-    def __init__(self, config: AudioConfig, *args, **kwargs):
+    def __call__(self, x: SLSequence) -> SLSequence:
+        return self.layers(x)
+
+class SequenceLayerConv2d(SequenceLayer):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel: tuple[int, int],
+        stride: tuple[int, int],
+        *args,
+        padding: tuple[int, int] = (0, 0),
+        use_bias: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel = kernel
+        self.stride = stride
+
+        self.padding = padding
+        self.use_bias = use_bias
+
+        self.conv = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            kernel_size=self.kernel,
+            stride=self.stride,
+            padding=self.padding,
+            bias=self.use_bias,
+        )
+
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y, mask = x
+        y = self.conv(y)
+        return y, mask
+
+
+class SequenceLayerDense(SequenceLayer):
+
+    def __init__(self, shape: tuple[int, int], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.shape = shape
+        self.weight = mx.empty(self.shape)
+
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y, mask = x
+        y = mx.einsum('...a,ab->...b', y, self.weight)
+        return y, mask
+
+
+class SequenceLayerDenseShaped(SequenceLayer):
+    def __init__(self, *args, input_shape: Sequence[int] = (), output_shape: Sequence[int] = (), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_shape = tuple(input_shape)
+        self.input_dims = "".join(chr(ord("a") + i) for i in range(len(self.input_shape)))
+        self.input_weight_shape = self.input_shape or (1,)
+        self.input_weight_dims = self.input_dims or "I"
+        self.output_shape = tuple(output_shape)
+        self.output_dims = "".join(
+            chr(ord("a") + i + len(self.input_shape))
+            for i in range(len(self.output_shape))
+        )
+        self.output_weight_shape = self.output_shape or (1,)
+        self.output_weight_dims = self.output_dims or "O"
+        self.equation = f"BT{self.input_dims},{self.input_weight_dims}{self.output_weight_dims}->BT{self.output_dims}"
+        
+        weight_shape = self.input_weight_shape + self.output_weight_shape
+        self.weight = mx.empty(weight_shape)
+        
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y, mask = x
+        y = mx.einsum(self.equation, y, self.weight)
+        return y, mask
+
+class SequenceLayerExpandDims(SequenceLayer):
+    def __init__(self, dims: Union[int, Sequence[int]], *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dims = (dims, ) if isinstance(dims, int) else dims
+
+    def _normalize_dims(self, x_ndims: int, ) -> Sequence[int]:
+        dims = [d + x_ndims if d < 0 else d for d in self.dims]
+        dims = sorted(dims)
+        for d in dims:
+            if d < 0 or d > x_ndims:
+                raise ValueError(f"Received invalid dim for expansion: {d}")
+        return dims
+
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y, mask = x
+        y_dims = self._normalize_dims(y.ndim)
+        for d in y_dims:
+            y = mx.expand_dims(y, axis=d)
+        return y, mask
+
+
+class SequenceLayerGatedLinearUnit(SequenceLayer):
+    def __call__(self, x: SLSequence) -> SLSequence:
+        x, mask = x
+        feature, gate = mx.split(x, 2, dim=-1)
+        gate = mx.sigmoid(gate)
+        x = feature * gate
+        return x, mask
+
+class SequenceLayerGroupNorm(SequenceLayer):
+    def __init__(self, num_groups: int, num_channels: int, *args, eps: float = 1e-3, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+
+        self.norm = nn.GroupNorm(num_groups=self.num_groups, num_channels=self.num_channels, eps=self.eps)
+
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y, mask = x
+        y = self.norm(y)
+        return y, mask
+
+class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
+    pass
+
+class SequenceLayerMaskInvalid(SequenceLayer):
+    pass
+
+class SequenceLayerRelu(SequenceLayer):
+    def __call__(self, x: SLSequence) -> SLSequence:
+        x, mask = x
+        x = nn.relu(x)
+        return x, mask
+
+
+class SequenceLayerResidual(SequenceLayer):
+
+    def __init__(
+        self,
+        layers: nn.Sequential,
+        *args,
+        shortcut_layers: Optional[nn.Sequential] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.layers = layers
+        self.shortcut_layers = shortcut_layers
+
+    def residual_function(self, x: SLSequence, shortcut_x: SLSequence ) -> SLSequence:
+        y = x[0] + shortcut_x[0]
+        mask = x[1] | shortcut_x[1]
+        return y, mask
+
+    def __call__(self, x: SLSequence) -> SLSequence:
+        y: SLSequence = self.layers(x)
+        if self.shortcut_layers is not None:
+            shortcut_y: SLSequence = self.shortcut_layers(x)
+            y = self.residual_function(y, shortcut_y)
+        return y
+
+
+class Gemma3p5AudioSSCPConvBlock(SequenceLayer):
+    def __init__(self, config: AudioConfig, idx: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
+
+        self.out_channels = self.config.sscp_conv_channel_size[idx]
+        self.kernel_size = self.config.sscp_conv_kernel_size[idx]
+        self.stride = self.config.sscp_conv_stride_size[idx]
+
+        # input_channels is equal to either the out_channels from the prior
+        # Conv2d or 1 if this is the first Conv2d.
+        if idx > 0:
+            self.input_channels = self.config.sscp_conv_channel_size[idx - 1]
+        else:
+            self.input_channels = 1
+
+        self.layers = nn.Sequential(OrderedDict([
+            ("conv2d", SequenceLayerConv2d(
+                in_channels=self.input_channels,
+                out_channels=self.out_channels,
+                kernel=self.kernel_size,
+                stride=self.stride,
+            )),
+            ("norm", SequenceLayerGroupNorm(num_groups=1, num_channels=self.out_channels)),
+            ("relu", SequenceLayerRelu()),
+        ]))
 
 
 class Gemma3p5AudioSubSampleConvProjection(nn.Module):
@@ -44,7 +233,7 @@ class Gemma3p5AudioConformerAttention(nn.Module):
         self.config = config
 
 
-class Gemma3p5AudioConformerFeedForward(nn.Module):
+class Gemma3p5AudioConformerFeed__call__(nn.Module):
 
     def __init__(self, config: AudioConfig, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -98,6 +287,13 @@ class AudioModel(nn.Module):
             for _ in range(config.conf_num_hidden_layers)
         ]
         self.uniform_reducer = Gemma3p5AudioUniformReducer(config)
+
+        self.layers = nn.Sequential(OrderedDict([
+            ("subsample_conv_projection", self.subsample_conv_projection),
+            ("conformer", self.conformer_blocks),
+            ("reducer", self.uniform_reducer),
+            ("mask_invalid", SequenceLayerMaskInvalid()),
+        ]))
 
     def __call__(self, x: mx.array) -> mx.array:
         raise NotImplementedError()
