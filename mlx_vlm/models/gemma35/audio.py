@@ -1,11 +1,11 @@
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable, Optional, OrderedDict, Tuple, Union
-from collections.abc import Sequence
-import math
-import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 
 @dataclass
