@@ -28,7 +28,7 @@ class AudioConfig:
 
 
 # (x: mx.array, mask: mx.BoolArray (no BoolArray in mlx))
-type SLSequence = Tuple[mx.array, mx.array]
+SLSequence = Tuple[mx.array, mx.array]  # type alias
 
 
 class SequenceLayer(nn.Module):
@@ -240,7 +240,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         if self.max_future_horizon == 0 and self.max_past_horizon == 0:
             raise ValueError("max_horizon and max_future_horizon cannot both be 0.")
         if self.attention_logits_soft_cap < 0.0:
-            raise ValueError(f"{self.attention_logits_soft_cap=} should be None or non-negative.")
+            raise ValueError(
+                f"{self.attention_logits_soft_cap=} should be None or non-negative."
+            )
 
         self.relative_position_embedding = relative_position_embedding
 
@@ -252,7 +254,11 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         )
 
     def _pad_dim1(
-        self, x: mx.array, dim10_val: int, dim11_val: int, padding_val: Union[bool, float] = 0.0
+        self,
+        x: mx.array,
+        dim10_val: int,
+        dim11_val: int,
+        padding_val: Union[bool, float] = 0.0,
     ) -> mx.array:
         padding_tuple = [0] * x.ndim * 2
         dim_idx_from_end = x.ndim - 2
@@ -263,7 +269,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = mx.pad(x, padding_tuple, mode="constant", constant_value=padding_val)
         return x
 
-    def _convert_to_block(self, x: mx.array, padding_val: Union[bool, float] = 0.0) -> mx.array:
+    def _convert_to_block(
+        self, x: mx.array, padding_val: Union[bool, float] = 0.0
+    ) -> mx.array:
         shape = x.shape
         b, t = shape[:2]
         num_blocks = (t + self.block_size - 1) // self.block_size
@@ -275,8 +283,15 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = x.permute(permute_dims).contiguous()
         return x
 
-    def _extract_block_context(self, x: mx.array, padding_val: Union[bool, float] = 0.0) -> mx.array:
-        x = self._pad_dim1(x, self.max_past_horizon, self.max_future_horizon + self.block_size + 1, padding_val)
+    def _extract_block_context(
+        self, x: mx.array, padding_val: Union[bool, float] = 0.0
+    ) -> mx.array:
+        x = self._pad_dim1(
+            x,
+            self.max_past_horizon,
+            self.max_future_horizon + self.block_size + 1,
+            padding_val,
+        )
 
         outer_dims = x.shape[:1]
         inner_dims = x.shape[2:]
@@ -289,7 +304,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         num_frames = (output_size + frame_step - 1) // frame_step
 
         if not num_frames:
-            return mx.zeros(outer_dims + (0, frame_len) + inner_dims, dtype=x.dtype, device=x.device)
+            return mx.zeros(
+                outer_dims + (0, frame_len) + inner_dims, dtype=x.dtype, device=x.device
+            )
 
         subframe_factor = math.gcd(frame_len, frame_step)
         padding_left = 0
@@ -325,12 +342,14 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         v = None
         # TODO: mx.select doesn't exist
 
-        #q = torch.select(qkv, dim=2, index=0).float()
-        #k = torch.select(qkv, dim=2, index=1).float()
-        #v = torch.select(qkv, dim=2, index=2).float()
+        # q = torch.select(qkv, dim=2, index=0).float()
+        # k = torch.select(qkv, dim=2, index=1).float()
+        # v = torch.select(qkv, dim=2, index=2).float()
 
         q_scale = 1 / math.sqrt(self.units_per_head)
-        r_softplus_0 = 1.442695041  # Ported from JAX Sequence Layers; 1.0 / jax.nn.softplus(0.0)
+        r_softplus_0 = (
+            1.442695041  # Ported from JAX Sequence Layers; 1.0 / jax.nn.softplus(0.0)
+        )
         q_scale = mx.array(q_scale * r_softplus_0, dtype=mx.float32)
         q = q * q_scale * nn.softplus(self.per_dim_scale)
 
@@ -342,7 +361,9 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         num_query_blocks = q_blocks.shape[1]
         v_blocks = self._extract_block_context(v)
 
-        valid_mask_blocks: mx.array = self._extract_block_context(mask, padding_val=False)
+        valid_mask_blocks: mx.array = self._extract_block_context(
+            mask, padding_val=False
+        )
         valid_mask_blocks = valid_mask_blocks.unsqueeze(1).unsqueeze(-2)
         lower_causal_mask = mx.tril(
             mx.ones((context_size, self.block_size), dtype=mx.bool_),
@@ -352,8 +373,12 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
             mx.ones((self.block_size, context_size), dtype=mx.bool_),
             diagonal=self.max_past_horizon + self.max_future_horizon,
         )
-        local_causal_valid_mask = mx.ones((self.block_size, context_size), dtype=mx.bool_)
-        local_causal_valid_mask = local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        local_causal_valid_mask = mx.ones(
+            (self.block_size, context_size), dtype=mx.bool_
+        )
+        local_causal_valid_mask = (
+            local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        )
         valid_mask_blocks = mx.logical_and(valid_mask_blocks, local_causal_valid_mask)
 
         # Embed queries and keys
@@ -365,11 +390,18 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         logits = mx.tanh(logits)
         logits = logits * softcap
 
-        logits = mx.where(valid_mask_blocks, logits, self.attention_invalid_logits_value)
+        logits = mx.where(
+            valid_mask_blocks, logits, self.attention_invalid_logits_value
+        )
         probabilities = mx.softmax(logits, dim=-1, dtype=mx.float32)
         context_vectors = mx.einsum("BNuwc,BucNH->BuwNH", probabilities, v_blocks)
         context_vectors = context_vectors.reshape(
-            (batch_size, num_query_blocks * self.block_size, self.num_heads, self.units_per_head)
+            (
+                batch_size,
+                num_query_blocks * self.block_size,
+                self.num_heads,
+                self.units_per_head,
+            )
         )
         context_vectors = context_vectors[:, :q_time]
 
@@ -380,17 +412,19 @@ class SequenceLayerMaskInvalid(SequenceLayer):
     def __call__(self, x: SLSequence) -> SLSequence:
         y, mask = x
         if mask.dtype != mx.bool_:
-             mask = mask.astype(mx.bool_)
+            mask = mask.astype(mx.bool_)
         expanded_mask = mask.expand_dims(-1)
         fill_value = mx.array(0.0, dtype=y.dtype)
         y_masked = mx.where(expanded_mask, fill_value, y)
         return y_masked, mask
+
 
 class SequenceLayerRelu(SequenceLayer):
     def __call__(self, x: SLSequence) -> SLSequence:
         x, mask = x
         x = nn.relu(x)
         return x, mask
+
 
 class SequenceLayerResidual(SequenceLayer):
     def __init__(
@@ -480,20 +514,30 @@ class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
             equation="...d,dnh->...nh",
         )
 
-    def _get_timing_signal_1d_pos(self, position: mx.array, channels: int, dtype: mx.dtype) -> mx.array:
+    def _get_timing_signal_1d_pos(
+        self, position: mx.array, channels: int, dtype: mx.dtype
+    ) -> mx.array:
         assert position.ndim == 2
         position = position.float().unsqueeze(-1)
 
         min_timescale = 1.0
         max_timescale = 1.0e4
         num_timescales = channels // 2
-        log_timescale_increment = math.log(float(max_timescale) / float(min_timescale)) / max(num_timescales - 1, 1)
-        inv_timescales = min_timescale * mx.exp(mx.arange(num_timescales) * -log_timescale_increment)
-        inv_timescales = inv_timescales.float().unsqueeze(0).unsqueeze(0).to(device=position.device)
+        log_timescale_increment = math.log(
+            float(max_timescale) / float(min_timescale)
+        ) / max(num_timescales - 1, 1)
+        inv_timescales = min_timescale * mx.exp(
+            mx.arange(num_timescales) * -log_timescale_increment
+        )
+        inv_timescales = (
+            inv_timescales.float().unsqueeze(0).unsqueeze(0).to(device=position.device)
+        )
 
         scaled_time = position * inv_timescales
 
-        timing_signal = mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], dim=-1)
+        timing_signal = mx.concatenate(
+            [mx.sin(scaled_time), mx.cos(scaled_time)], dim=-1
+        )
         timing_signal_padding = (0, np.mod(channels, 2), 0, 0, 0, 0)
         timing_signal = mx.pad(timing_signal, timing_signal_padding)
 
@@ -511,7 +555,9 @@ class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
         pos = mx.arange(l, -r - 1, -1).unsqueeze(0)
         assert pos.shape == (1, lr + 1)
 
-        sin_emb = self._get_timing_signal_1d_pos(pos, self.position_bias_dim, dtype=queries.dtype)
+        sin_emb = self._get_timing_signal_1d_pos(
+            pos, self.position_bias_dim, dtype=queries.dtype
+        )
         sin_emb: mx.array = self.pos_proj((sin_emb, None))[0]
         sin_emb = sin_emb.squeeze(0)
 
@@ -520,7 +566,7 @@ class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
 
         # Perform relative shift in order to get [B, N, U, W, C]
         # Pads the input to [B, N, U, W, C + 1]
-        term_bd_pad = (0, c - lr, 0, 0, 0, 0, 0, 0, 0, 0)
+        term_bd_pad = (0, c - lr, 0, 0, 0, 0)
         term_bd = nn.functional.pad(term_bd, term_bd_pad)
         term_bd = term_bd.reshape((b, n, u, w * (c + 1)))
         term_bd = term_bd[:, :, :, : w * c]
@@ -610,23 +656,24 @@ class Gemma3p5AudioConformerAttention(SequenceLayer):
                             "pre_attn_norm",
                             SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
                         ),
-
-                ("attn", SequenceLayerLocalDotProductSelfAttention(
-                    num_heads=self.config.conf_num_attention_heads,
-                    hidden_size=self.config.hidden_size,
-                    block_size=self.config.conf_attention_chunk_size,
-                    attention_logits_soft_cap=self.config.conf_attention_logit_cap,
-                    max_past_horizon=self.config.conf_attention_context_left,
-                    max_future_horizon=self.config.conf_attention_context_right,
-                    relative_position_embedding=SequenceLayerTransformerXLRelativePositionEmbedding(
-                        num_heads=self.config.conf_num_attention_heads,
-                        hidden_size=self.config.hidden_size,
-                        max_backward=self.config.conf_attention_context_left,
-                        max_forward=self.config.conf_attention_context_right,
-                        position_bias_dim=self.config.hidden_size,
-                    ),
-                )),
-
+                        (
+                            "attn",
+                            SequenceLayerLocalDotProductSelfAttention(
+                                num_heads=self.config.conf_num_attention_heads,
+                                hidden_size=self.config.hidden_size,
+                                block_size=self.config.conf_attention_chunk_size,
+                                attention_logits_soft_cap=self.config.conf_attention_logit_cap,
+                                max_past_horizon=self.config.conf_attention_context_left,
+                                max_future_horizon=self.config.conf_attention_context_right,
+                                relative_position_embedding=SequenceLayerTransformerXLRelativePositionEmbedding(
+                                    num_heads=self.config.conf_num_attention_heads,
+                                    hidden_size=self.config.hidden_size,
+                                    max_backward=self.config.conf_attention_context_left,
+                                    max_forward=self.config.conf_attention_context_right,
+                                    position_bias_dim=self.config.hidden_size,
+                                ),
+                            ),
+                        ),
                         (
                             "post_attn_dense",
                             SequenceLayerDenseShaped(
@@ -699,23 +746,47 @@ class Gemma3p5AudioConformerLightConv1d(SequenceLayer):
         self.config = config
 
         self.layers = SequenceLayerResidual(
-            layers=nn.Sequential(OrderedDict([
-                ("pre_layer_norm", SequenceLayerRMSNorm(shape=(self.config.hidden_size, ))),
-                ("linear_start", SequenceLayerDense(shape=(self.config.hidden_size, self.config.hidden_size * 2))),
-                ("glu", SequenceLayerGatedLinearUnit()),
-                ("depthwise_conv1d", SequenceLayerDepthwiseConv1D(
-                    in_channels=self.config.hidden_size,
-                    out_channels=self.config.hidden_size,
-                    kernel_size=self.config.conf_conv_kernel_size,
-                    num_groups=self.config.hidden_size,
-                )),
-                ("conv_norm", SequenceLayerRMSNorm(shape=(self.config.hidden_size, ))),
-                ("conv_activation", SequenceLayerSwish()),
-                ("linear_end", SequenceLayerDense(shape=(self.config.hidden_size, self.config.hidden_size))),
-            ]))
+            layers=nn.Sequential(
+                OrderedDict(
+                    [
+                        (
+                            "pre_layer_norm",
+                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
+                        ),
+                        (
+                            "linear_start",
+                            SequenceLayerDense(
+                                shape=(
+                                    self.config.hidden_size,
+                                    self.config.hidden_size * 2,
+                                )
+                            ),
+                        ),
+                        ("glu", SequenceLayerGatedLinearUnit()),
+                        (
+                            "depthwise_conv1d",
+                            SequenceLayerDepthwiseConv1D(
+                                in_channels=self.config.hidden_size,
+                                out_channels=self.config.hidden_size,
+                                kernel_size=self.config.conf_conv_kernel_size,
+                                num_groups=self.config.hidden_size,
+                            ),
+                        ),
+                        (
+                            "conv_norm",
+                            SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
+                        ),
+                        ("conv_activation", SequenceLayerSwish()),
+                        (
+                            "linear_end",
+                            SequenceLayerDense(
+                                shape=(self.config.hidden_size, self.config.hidden_size)
+                            ),
+                        ),
+                    ]
+                )
+            )
         )
-
-
 
 
 class Gemma3p5AudioConformerBlock(SequenceLayer):
@@ -761,15 +832,29 @@ class AudioModel(nn.Module):
         ]
         self.uniform_reducer = Gemma3p5AudioUniformReducer(config)
 
-        self.layers = nn.Sequential(OrderedDict([
-            ("subsample_conv_projection", Gemma3p5AudioSubSampleConvProjection(config)),
-            ("conformer", nn.Sequential(OrderedDict([
-                (f"block_{i}", Gemma3p5AudioConformerBlock(config))
-                for i in range(config.conf_num_hidden_layers)
-            ]))),
-            ("reducer", Gemma3p5AudioUniformReducer(config)),
-            ("mask_invalid", SequenceLayerMaskInvalid()),
-        ]))
+        self.layers = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "subsample_conv_projection",
+                        Gemma3p5AudioSubSampleConvProjection(config),
+                    ),
+                    (
+                        "conformer",
+                        nn.Sequential(
+                            OrderedDict(
+                                [
+                                    (f"block_{i}", Gemma3p5AudioConformerBlock(config))
+                                    for i in range(config.conf_num_hidden_layers)
+                                ]
+                            )
+                        ),
+                    ),
+                    ("reducer", Gemma3p5AudioUniformReducer(config)),
+                    ("mask_invalid", SequenceLayerMaskInvalid()),
+                ]
+            )
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         raise NotImplementedError()
