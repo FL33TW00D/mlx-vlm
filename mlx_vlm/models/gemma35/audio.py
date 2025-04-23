@@ -253,7 +253,7 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
 
     def _pad_dim1(
         self, x: mx.array, dim10_val: int, dim11_val: int, padding_val: Union[bool, float] = 0.0
-    ) -> mx.array: 
+    ) -> mx.array:
         padding_tuple = [0] * x.ndim * 2
         dim_idx_from_end = x.ndim - 2
         start_idx_for_dim = 2 * dim_idx_from_end
@@ -319,7 +319,7 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         y, mask = x
 
         qkv: mx.Tensor = self.qkv_proj(y)
-        
+
         q = None
         k = None
         v = None
@@ -610,7 +610,7 @@ class Gemma3p5AudioConformerAttention(SequenceLayer):
                             "pre_attn_norm",
                             SequenceLayerRMSNorm(shape=(self.config.hidden_size,)),
                         ),
-                        
+
                 ("attn", SequenceLayerLocalDotProductSelfAttention(
                     num_heads=self.config.conf_num_attention_heads,
                     hidden_size=self.config.hidden_size,
