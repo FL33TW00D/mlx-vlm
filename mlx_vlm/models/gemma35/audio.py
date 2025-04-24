@@ -75,55 +75,46 @@ class SequenceLayerConv2d(SequenceLayer):
         return y, mask
 
 
-class SequenceLayerEinsum(SequenceLayer):
 
-    def __init__(self, shape: Sequence[int], equation: str, *args, **kwargs):
+class SequenceLayerDense(SequenceLayer):
+    def __init__(self, shape: tuple[int, int], *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.shape = shape
-        self.equation = equation
-        self.weight = mx.empty(self.shape)
+        self.weight = mx.zeros(self.shape)
 
-    def forward(self, x: SLSequence) -> SLSequence:
+    def __call__(
+        self,
+        x: SLSequence,
+    ) -> SLSequence:
         y, mask = x
-        y = mx.einsum(self.equation, y, self.weight)
+        batch_dims = y.shape[:-1]
+        a_dim, b_dim = self.shape
+        y_flat = y.reshape(-1, a_dim)
+        y_flat_dense = mx.matmul(y_flat, self.weight)
+        y = y_flat_dense.reshape(*batch_dims, b_dim)
         return y, mask
 
 
-class SequenceLayerDense(SequenceLayerEinsum):
-    def __init__(self, shape: tuple[int, int], *args, **kwargs):
-        super().__init__(*args, shape=shape, equation="...a,ab->...b", **kwargs)
-
-
 class SequenceLayerDenseShaped(SequenceLayer):
-    def __init__(
-        self,
-        *args,
-        input_shape: Sequence[int] = (),
-        output_shape: Sequence[int] = (),
-        **kwargs,
-    ):
+    def __init__(self, *args, input_shape: Sequence[int] = (), output_shape: Sequence[int] = (), **kwargs):
         super().__init__(*args, **kwargs)
+
         self.input_shape = tuple(input_shape)
-        self.input_dims = "".join(
-            chr(ord("a") + i) for i in range(len(self.input_shape))
-        )
-        self.input_weight_shape = self.input_shape or (1,)
-        self.input_weight_dims = self.input_dims or "I"
+        self.input_prod = np.prod(self.input_shape) if self.input_shape else 1
+
         self.output_shape = tuple(output_shape)
-        self.output_dims = "".join(
-            chr(ord("a") + i + len(self.input_shape))
-            for i in range(len(self.output_shape))
-        )
-        self.output_weight_shape = self.output_shape or (1,)
-        self.output_weight_dims = self.output_dims or "O"
-        self.equation = f"BT{self.input_dims},{self.input_weight_dims}{self.output_weight_dims}->BT{self.output_dims}"
+        self.output_prod = np.prod(self.output_shape) if self.output_shape else 1
 
-        weight_shape = self.input_weight_shape + self.output_weight_shape
-        self.weight = mx.empty(weight_shape)
+        self.weight = mx.zeros(self.input_weight_shape + self.output_weight_shape)
 
-    def __call__(self, x: SLSequence) -> SLSequence:
+    def forward(self, x: SLSequence) -> SLSequence:
         y, mask = x
-        y = mx.einsum(self.equation, y, self.weight)
+        # Note: In JAX code, sl.DenseShaped modifies y with jax.numpy.einsum() and an equation inferred from the input
+        batch_dims = y.shape[:-len(self.input_shape)]
+        y_flat = y.reshape(-1, self.input_prod)
+        weight_flat = self.weight.reshape(self.input_prod, self.output_prod)
+        output_flat = mx.matmul(y_flat, weight_flat)
+        y = output_flat.reshape(*batch_dims, *self.output_shape)
         return y, mask
 
 
@@ -243,13 +234,8 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
             raise ValueError(f"{self.attention_logits_soft_cap=} should be None or non-negative.")
 
         self.relative_position_embedding = relative_position_embedding
-
-        self.per_dim_scale = mx.empty((self.units_per_head,))
-
-        self.qkv_proj = SequenceLayerEinsum(
-            shape=(self.hidden_size, 3, self.num_heads, self.units_per_head),
-            equation="...a,abcd->...bcd",
-        )
+        self.per_dim_scale = mx.zeros((self.units_per_head,))
+        self.qkv_proj = mx.zeros((self.hidden_size,3,self.num_heads,self.units_per_head))
 
     def _pad_dim1(
         self, x: mx.array, dim10_val: int, dim11_val: int, padding_val: Union[bool, float] = 0.0
@@ -315,19 +301,21 @@ class SequenceLayerLocalDotProductSelfAttention(SequenceLayer):
         x = x.permute(*permute_dims).contiguous()
         return x
 
-    def forward(self, x: SLSequence) -> SLSequence:
+    def __call__(self, x: SLSequence) -> SLSequence:
         y, mask = x
 
-        qkv: mx.Tensor = self.qkv_proj(y)
 
-        q = None
-        k = None
-        v = None
-        # TODO: mx.select doesn't exist
+        #Einsum in the JAX
+        batch_dims = y.shape[:-1]
+        a_dim, b_dim, c_dim, d_dim = self.qkv_proj.shape
+        y_flat = y.reshape(-1, a_dim)
+        qkv_flat = self.qkv_proj.reshape(a_dim, b_dim * c_dim * d_dim)
+        y_qkv_flat = mx.matmul(y_flat, qkv_flat)
+        qkv = y_qkv_flat.reshape(*batch_dims, b_dim, c_dim, d_dim)
 
-        #q = torch.select(qkv, dim=2, index=0).float()
-        #k = torch.select(qkv, dim=2, index=1).float()
-        #v = torch.select(qkv, dim=2, index=2).float()
+        q = mx.take_along_axis(qkv, indices=mx.array([0]), axis=2).astype(mx.float32)
+        k = mx.take_along_axis(qkv, indices=mx.array([1]), axis=2).astype(mx.float32)
+        v = mx.take_along_axis(qkv, indices=mx.array([2]), axis=2).astype(mx.float32)
 
         q_scale = 1 / math.sqrt(self.units_per_head)
         r_softplus_0 = 1.442695041  # Ported from JAX Sequence Layers; 1.0 / jax.nn.softplus(0.0)
@@ -475,10 +463,7 @@ class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
         self.max_forward = max_forward
         self.position_bias_dim = position_bias_dim
 
-        self.pos_proj = SequenceLayerEinsum(
-            shape=(self.hidden_size, self.num_heads, self.units_per_head),
-            equation="...d,dnh->...nh",
-        )
+        self.pos_proj = mx.zeros((self.hidden_size, self.num_heads, self.units_per_head)) 
 
     def _get_timing_signal_1d_pos(self, position: mx.array, channels: int, dtype: mx.dtype) -> mx.array:
         assert position.ndim == 2
@@ -512,8 +497,14 @@ class SequenceLayerTransformerXLRelativePositionEmbedding(nn.Module):
         assert pos.shape == (1, lr + 1)
 
         sin_emb = self._get_timing_signal_1d_pos(pos, self.position_bias_dim, dtype=queries.dtype)
-        sin_emb: mx.array = self.pos_proj((sin_emb, None))[0]
-        sin_emb = sin_emb.squeeze(0)
+
+        # Einsum in original JAX
+        batch_dims = sin_emb.shape[:-1]
+        d_dim, n_dim, h_dim = self.pos_proj.shape
+        sin_emb_flat = sin_emb.reshape(-1, d_dim)
+        pos_proj_flat = self.pos_proj.reshape(d_dim, n_dim * h_dim)
+        sin_emb_pos_proj_flat = torch.matmul(sin_emb_flat, pos_proj_flat)
+        sin_emb = sin_emb_pos_proj_flat.reshape(*batch_dims, n_dim, h_dim)
 
         term_ac = mx.einsum("BuwNH,BucNH->BNuwc", queries, keys)
         term_bd = mx.einsum("BuwNH,FNH->BNuwF", queries, sin_emb)
