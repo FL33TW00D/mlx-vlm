@@ -345,10 +345,10 @@ class AudioAttention(nn.Module):
         # comply with the Transformers style guide.
         b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
         h_dim = v_blocks.shape[-1]
-        prob_bun = probabilities.permute(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
-        v_bun = v_blocks.permute(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
+        prob_bun = probabilities.transpose(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
+        v_bun = v_blocks.transpose(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
         result_bmm = mx.matmul(prob_bun, v_bun)
-        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).permute(
+        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).transpose(
             0, 1, 3, 2, 4
         )
         context_vectors = context_vectors.reshape(
