@@ -390,8 +390,9 @@ class Gemma3p5AudioSSCPConvBlock(nn.Module):
         )
         self.norm = nn.GroupNorm(
             num_groups=1,
-            num_channels=self.out_channels,
+            dims=self.out_channels,
             eps=self.config.sscp_conv_group_norm_eps,
+            pytorch_compatible=True,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
