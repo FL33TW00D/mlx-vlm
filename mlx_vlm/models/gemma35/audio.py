@@ -51,7 +51,7 @@ class Gemma3p5RMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
-    def forward(self, x: mx.array):
+    def __call__(self, x: mx.array):
         x, original_dtype = self._guard_against_excess_precision(x)
 
         scale = self.weight
@@ -115,7 +115,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
 
         return timing_signal.type(dtype)
 
-    def forward(self, queries: mx.array, keys: mx.array) -> mx.array:
+    def __call__(self, queries: mx.array, keys: mx.array) -> mx.array:
         b, u, w = queries.shape[:3]
         _, _, c = keys.shape[:3]
         n = self.num_heads
@@ -482,7 +482,7 @@ class Gemma3p5AudioConformerFeedForward(nn.Module):
 
 class Gemma3p5AudioConformerLightConv1d(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.pre_layer_norm = Gemma3p5RMSNorm(self.config.hidden_size)
@@ -506,7 +506,7 @@ class Gemma3p5AudioConformerLightConv1d(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         x = self.pre_layer_norm(x)
         x = self.linear_start(x)
-        x = nn.glu(x, dim=-1)
+        x = nn.glu(x, axis=-1)
         x = self.depthwise_conv1d(x)
         x = self.conv_norm(x)
         x = nn.silu(x)
@@ -516,7 +516,7 @@ class Gemma3p5AudioConformerLightConv1d(nn.Module):
 class Gemma3p5AudioConformerBlock(nn.Module):
 
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.ffw_layer_start = Gemma3p5AudioConformerFeedForward(self.config)
@@ -525,7 +525,7 @@ class Gemma3p5AudioConformerBlock(nn.Module):
         self.ffw_layer_end = Gemma3p5AudioConformerFeedForward(self.config)
         self.norm = Gemma3p5RMSNorm(self.config.hidden_size)
 
-    def forward(self, x: mx.array, mask: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
         x = self.ffw_layer_start(x)
         x = self.attention(x, mask)
         x = self.lconv1d(x)
@@ -536,16 +536,15 @@ class Gemma3p5AudioConformerBlock(nn.Module):
 
 class AudioModel(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(config, *args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.subsample_conv_projection = Gemma3p5AudioSubSampleConvProjection(config)
-        self.conformer = nn.ModuleList(
-            [
-                Gemma3p5AudioConformerBlock(config)
-                for _ in range(config.conf_num_hidden_layers)
-            ]
-        )
+        self.conformer = [
+            Gemma3p5AudioConformerBlock(config)
+            for _ in range(config.conf_num_hidden_layers)
+        ]
+
 
     def __call__(self, x: mx.array, mask: mx.array) -> Tuple[mx.array, mx.array]:
         x = self.subsample_conv_projection(x)
