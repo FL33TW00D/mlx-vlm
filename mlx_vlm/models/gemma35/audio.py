@@ -90,7 +90,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         self, position: mx.array, channels: int, dtype: mx.dtype
     ) -> mx.array:
         assert position.ndim == 2
-        position = mx.expand_dims(position.float(), axes=-1)
+        position = mx.expand_dims(position.float(), axis=-1)
 
         min_timescale = 1.0
         max_timescale = 1.0e4
@@ -102,7 +102,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
             mx.arange(num_timescales) * -log_timescale_increment
         )
         inv_timescales = mx.expand_dims(
-            mx.expand_dims(inv_timescales.float(), axes=0), axes=0
+            mx.expand_dims(inv_timescales.float(), axis=0), axis=0
         ).to(device=position.device)
 
         scaled_time = position * inv_timescales
@@ -125,7 +125,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         lr = l + r
         assert c == w + lr
 
-        pos = mx.expand_dims(mx.arange(l, -r - 1, -1), axes=0)
+        pos = mx.expand_dims(mx.arange(l, -r - 1, -1), axis=0)
         assert pos.shape == (1, lr + 1)
 
         sin_emb = self._get_timing_signal_1d_pos(
