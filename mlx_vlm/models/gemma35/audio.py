@@ -90,7 +90,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         self, position: mx.array, channels: int, dtype: mx.dtype
     ) -> mx.array:
         assert position.ndim == 2
-        position = position.float().unsqueeze(-1)
+        position = mx.expand_dims(position.float(), axes=-1)
 
         min_timescale = 1.0
         max_timescale = 1.0e4
@@ -101,9 +101,9 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         inv_timescales = min_timescale * mx.exp(
             mx.arange(num_timescales) * -log_timescale_increment
         )
-        inv_timescales = (
-            inv_timescales.float().unsqueeze(0).unsqueeze(0).to(device=position.device)
-        )
+        inv_timescales = mx.expand_dims(
+            mx.expand_dims(inv_timescales.float(), axes=0), axes=0
+        ).to(device=position.device)
 
         scaled_time = position * inv_timescales
 
@@ -125,7 +125,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
         lr = l + r
         assert c == w + lr
 
-        pos = mx.arange(l, -r - 1, -1).unsqueeze(0)
+        pos = mx.expand_dims(mx.arange(l, -r - 1, -1), axes=0)
         assert pos.shape == (1, lr + 1)
 
         sin_emb = self._get_timing_signal_1d_pos(
@@ -309,7 +309,8 @@ class AudioAttention(nn.Module):
         valid_mask_blocks: mx.array = self._extract_block_context(
             mask, padding_val=False
         )
-        valid_mask_blocks = valid_mask_blocks.unsqueeze(1).unsqueeze(-2)
+        valid_mask_blocks = mx.expand_dims(valid_mask_blocks, axis=1)
+        valid_mask_blocks = mx.expand_dims(valid_mask_blocks, axis=-2)
         lower_causal_mask = mx.tril(
             mx.ones((context_size, self.block_size), dtype=mx.bool_),
             diagonal=0,
@@ -418,7 +419,7 @@ class Gemma3p5AudioSubSampleConvProjection(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x.unsqueeze(-1)
+        x = mx.expand_dims(x, axis=-1)
         x = self.conv_0(x)
         x = self.conv_1(x)
         batch_dims = x.shape[: -len(self.input_proj_in_shape)]
