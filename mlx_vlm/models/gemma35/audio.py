@@ -38,7 +38,7 @@ class Gemma3p5RMSNorm(nn.Module):
         with_scale: bool = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
@@ -73,7 +73,7 @@ class Gemma3p5RMSNorm(nn.Module):
 class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
 
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.num_heads = self.config.conf_num_attention_heads
@@ -168,7 +168,7 @@ class Gemma3p5AudioRelativePositionEmbedding(nn.Module):
 
 class AudioAttention(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.num_heads = self.config.conf_num_attention_heads
@@ -366,7 +366,7 @@ class AudioAttention(nn.Module):
 
 class Gemma3p5AudioSSCPConvBlock(nn.Module):
     def __init__(self, config: AudioConfig, idx: int, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.out_channels = self.config.sscp_conv_channel_size[idx]
@@ -403,7 +403,7 @@ class Gemma3p5AudioSSCPConvBlock(nn.Module):
 class Gemma3p5AudioSubSampleConvProjection(nn.Module):
 
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.input_proj_in_shape = (
@@ -430,7 +430,7 @@ class Gemma3p5AudioSubSampleConvProjection(nn.Module):
 
 class Gemma3p5AudioConformerAttention(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         unit_per_head = self.config.hidden_size // self.config.conf_num_attention_heads
@@ -458,7 +458,7 @@ class Gemma3p5AudioConformerAttention(nn.Module):
 
 class Gemma3p5AudioConformerFeedForward(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.config = config
 
         self.pre_layer_norm = Gemma3p5RMSNorm(self.config.hidden_size)
