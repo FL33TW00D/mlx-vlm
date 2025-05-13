@@ -23,6 +23,7 @@ class TextConfig:
     num_key_value_heads: int = 4
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5
+    altup_active_idx: int = 0
     altup_num_inputs: int = 4
     altup_coef_clip: Optional[float] = None
     altup_correct_scale: bool = True
@@ -93,7 +94,8 @@ class Gemma3p5RMSNorm(nn.Module):
         else:
             self.weight = None
 
-
+    def _norm(self, x: mx.array) -> mx.array:
+        return x * mx.rsqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self._guard_against_excess_precision(x)
@@ -101,8 +103,13 @@ class Gemma3p5RMSNorm(nn.Module):
         scale = self.weight if self.weight is not None else mx.array(1.0)
         if self.scale_shift != 0.0:
             scale += self.scale_shift
-        output = mx.fast.rms_norm(x, 1.0 + scale, self.eps)
-        return output.type_as(x)
+
+        output = self._norm(x)
+        # Llama does x.astype(mx.float16) * w whilst Gemma2 is (x * w).astype(mx.float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * scale
+        return output.astype(x.dtype)
+
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -316,7 +323,8 @@ class Gemma3p5AltUp(nn.Module):
         modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
 
         if self.config.altup_coef_clip is not None:
-            self.prediction_coefs.weight.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+            self.prediction_coefs.weight = mx.clip(self.prediction_coefs.weight, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+
 
         # all_coefs adapted from jax.numpy.einsum("...p,pij->...ij", ...)
         all_coefs: mx.array = self.prediction_coefs(modalities)
@@ -333,7 +341,7 @@ class Gemma3p5AltUp(nn.Module):
                 output += coef * x[j]
 
             x_i = x[i]
-            outputs[i] = (x_i + output).type(x_i.dtype)
+            outputs[i] = (x_i + output).astype(x_i.dtype)
 
         return outputs
 
@@ -341,7 +349,7 @@ class Gemma3p5AltUp(nn.Module):
         modalities = self.compute_router_modalities(activated)
 
         if self.config.altup_coef_clip is not None:
-            self.correction_coefs.weight.clamp_(-self.config.altup_coef_clip, self.config.altup_coef_clip)
+            self.correction_coefs.weight = mx.clip(self.correction_coefs.weight, -self.config.altup_coef_clip, self.config.altup_coef_clip)
 
         # all_coefs adapted from jax.numpy.einsum("...p,pi->...i", ...)
         all_coefs: mx.array = self.correction_coefs(modalities)
@@ -351,7 +359,7 @@ class Gemma3p5AltUp(nn.Module):
         corrected = [mx.zeros_like(predictions[0])] * self.config.altup_num_inputs
         for i in range(self.config.altup_num_inputs):
             coef = mx.expand_dims(all_coefs[..., i] + 1, axis=-1)
-            corrected[i] = (predictions[i] + coef * innovation).type(activated.dtype)
+            corrected[i] = (predictions[i] + coef * innovation).astype(activated.dtype)
 
         return corrected
 
@@ -421,9 +429,8 @@ class Gemma3p5DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        **kwargs,
+        per_layer_input: Optional[mx.array] = None,
     ):
-        per_layer_input = kwargs.get("per_layer_input")
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -541,7 +548,7 @@ class Gemma3Model(nn.Module):
         if per_layer_inputs is None and inputs is not None:
             per_layer_inputs = self.get_per_layer_inputs(inputs)
 
-        per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -553,7 +560,8 @@ class Gemma3Model(nn.Module):
 
         h0 = h
         # Expand hidden_states to support per-layer inputs
-        target_magnitude = mx.mean(h0**2, axis=-1) ** 0.5
+
+        target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
         epsilon_tensor = mx.finfo(mx.float16).min
 
         h: list[mx.array] = [h0] * self.config.altup_num_inputs
@@ -561,8 +569,8 @@ class Gemma3Model(nn.Module):
         for i in range(1, self.config.altup_num_inputs):
             # altup_proj adapted from jax.numpy.einsum("btp,pd->btd", ...)
             altup_proj: mx.array = self.altup_projections[i - 1](h[i])
-            h[i] = altup_proj.type(h0.dtype)
-            new_magnitude = mx.mean(h[i] ** 2, axis=-1) ** 0.5
+            h[i] = altup_proj.astype(h0.dtype)
+            new_magnitude = mx.mean(h[i] ** 2, axis=-1, keepdims=True) ** 0.5
             h[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
@@ -581,12 +589,13 @@ class Gemma3Model(nn.Module):
             h = layer(h, local_mask, c, per_layer_input)
 
          # Per-layer inputs to single output
-        target_magnitude = mx.mean(h ** 2, axis=-1) ** 0.5
+        target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
+
         for i in range(1, self.config.altup_num_inputs):
             # altup_unembed_projections adapted from jax.numpy.einsum("btp,pd->btd", ...)
             altup_unemb_proj = self.altup_unembed_projections[i - 1](h[i])
-            h[i] = altup_unemb_proj.type(h0.dtype)
-            new_magnitude = mx.mean(h[i] ** 2, axis=-1) ** 0.5
+            h[i] = altup_unemb_proj.astype(h0.dtype)
+            new_magnitude = mx.mean(h[i] ** 2, axis=-1, keepdims=True) ** 0.5
             h[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
 
         h = mx.mean(mx.stack(h), axis=0)
@@ -598,7 +607,7 @@ class Gemma3Model(nn.Module):
         per_layer_inputs_mask = mx.logical_and(input_ids >= 0, input_ids < self.vocab_size)
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens).reshape(
-            *input_ids.shape, self.config.num_hidden_layers, self.hidden_size_per_layer_input
+            *input_ids.shape, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
         ) * mx.array(self.config.hidden_size**0.5, mx.bfloat16)
         return result.astype(input_ids.dtype)
 
@@ -606,7 +615,7 @@ class Gemma3Model(nn.Module):
         self, inputs_embeds: mx.array, per_layer_inputs: Optional[mx.array] = None
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(inputs_embeds).reshape(
-            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.hidden_size_per_layer_input
+            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
 
