@@ -143,7 +143,7 @@ class Gemma3p5LaurelBlock(nn.Module):
         return x
 
 
-class Attention(nn.Module):
+class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int, num_layers_that_compute_kv: int):
         super().__init__()
 
@@ -161,18 +161,6 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
-
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
-            base=(
-                config.rope_local_base_freq
-                if self.is_sliding
-                else config.rope_global_base_freq
-            ),
-        )
-
         self.qkv_norm = Gemma3p5RMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
@@ -184,6 +172,16 @@ class Attention(nn.Module):
             self.is_kv_shared_layer = False
         else:
             self.is_kv_shared_layer = layer_idx >= num_layers_that_compute_kv
+
+        self.rope = nn.RoPE(
+            head_dim,
+            traditional=config.rope_traditional,
+            base=(
+                config.rope_local_base_freq
+                if self.is_kv_shared_layer
+                else config.rope_global_base_freq
+            ),
+        )
 
 
     def __call__(
@@ -210,7 +208,7 @@ class Attention(nn.Module):
             values = self.qkv_norm(values)
 
         # Sliding window
-        if mask is not None and isinstance(mask, mx.array):
+        if self.is_kv_shared_layer and mask is not None and isinstance(mask, mx.array):
             if mask.shape[-1] != keys.shape[-2]:
                 mask = mask[..., -keys.shape[-2] :]
 
@@ -401,7 +399,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = Attention(config, layer_idx, num_layers_that_compute_kv)
+        self.self_attn = Gemma3p5Attention(config, layer_idx, num_layers_that_compute_kv)
         self.mlp = MLP(config)
         self.input_layernorm = Gemma3p5RMSNorm(
             dim=self.hidden_size,
@@ -410,7 +408,6 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.post_attention_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.pre_feedforward_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_feedforward_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.is_sliding = self.self_attn.is_sliding
         self.sliding_window = config.sliding_window
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
@@ -485,8 +482,7 @@ class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
         self.embed_scale = embed_scale
 
     def __call__(self, x: mx.array):
-        h = super().__call__(x) * mx.array(self.embed_scale, mx.bfloat16).astype(self.weight.dtype)
-        return h
+        return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(self.weight.dtype)
 
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
@@ -543,7 +539,7 @@ class Gemma3Model(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs: mx.array=None,
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
@@ -564,7 +560,7 @@ class Gemma3Model(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            j = self.config.sliding_window_pattern
+            j = self.num_layers_that_compute_kv
             full_mask = create_attention_mask(h, cache[j - 1 : j])
             sliding_window_mask = create_attention_mask(h, cache)
 
@@ -650,7 +646,7 @@ class LanguageModel(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
+        inputs: mx.array=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
@@ -683,16 +679,30 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         caches = []
+        attention_pattern_length = self.config.sliding_window_pattern
+        frac_unshared_layers = 1 - self.config.frac_shared_layers
+        num_unshared_layers: int = round(self.config.num_hidden_layers * frac_unshared_layers)
+
+
+        if num_unshared_layers >= attention_pattern_length:
+            numerator = num_unshared_layers + attention_pattern_length - 1
+            num_unshared_layers = attention_pattern_length * numerator // attention_pattern_length
+        else:
+            print(
+                "Not rounding unshared layers. round_up_to_nearest_attention_block is"
+                " False or num_unshared_layers is less than attention_pattern_length."
+            )
+
         for i in range(self.config.num_hidden_layers):
             if (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
+                i % num_unshared_layers
+                == num_unshared_layers - 1
             ):
                 caches.append(KVCache())
             else:
                 caches.append(
                     RotatingKVCache(
-                        max_size=self.config.sliding_window,
+                        max_size=attention_pattern_length,
                         keep=0,
                     )
                 )
