@@ -511,7 +511,7 @@ class Gemma3Model(nn.Module):
             )
         self.num_layers_that_compute_kv = num_unshared_layers
 
-        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(config.vocab_size, config.hidden_size, config.hidden_size**0.5)
+        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5)
         self.layers = [
             Gemma3p5DecoderLayer(config=config, layer_idx=layer_idx, num_layers_that_compute_kv=self.num_layers_that_compute_kv)
             for layer_idx in range(config.num_hidden_layers)
@@ -520,7 +520,7 @@ class Gemma3Model(nn.Module):
         self.embed_tokens_per_layer = Gemma3p5TextScaledWordEmbedding(
             config.vocab_size,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
-            config.hidden_size_per_layer_input**0.5,
+            embed_scale=config.hidden_size_per_layer_input**0.5,
         )
 
         self.per_layer_model_projection = nn.Linear(
