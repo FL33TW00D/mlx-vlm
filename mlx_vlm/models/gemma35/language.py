@@ -485,8 +485,8 @@ class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
         self.embed_scale = embed_scale
 
     def __call__(self, x: mx.array):
-        h = super().__call__(x) * mx.array(self.embed_scale, mx.bfloat16)
-        return h.astype(self.weight.dtype)
+        h = super().__call__(x) * mx.array(self.embed_scale, mx.bfloat16).astype(self.weight.dtype)
+        return h
 
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
