@@ -475,6 +475,18 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         return corrected_predictions
 
+class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
+    """
+    This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, embed_scale: Optional[float] = 1.0):
+        super().__init__(num_embeddings, embedding_dim)
+        self.embed_scale = embed_scale
+
+    def __call__(self, x: mx.array):
+        h = super().__call__(x) * mx.array(self.embed_scale, mx.bfloat16)
+        return h.astype(self.weight.dtype)
 
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
@@ -499,16 +511,16 @@ class Gemma3Model(nn.Module):
             )
         self.num_layers_that_compute_kv = num_unshared_layers
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(config.vocab_size, config.hidden_size, config.hidden_size**0.5)
         self.layers = [
             Gemma3p5DecoderLayer(config=config, layer_idx=layer_idx, num_layers_that_compute_kv=self.num_layers_that_compute_kv)
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.embed_tokens_per_layer = nn.Embedding(
+        self.embed_tokens_per_layer = Gemma3p5TextScaledWordEmbedding(
             config.vocab_size,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
-
+            config.hidden_size_per_layer_input**0.5,
         )
 
         self.per_layer_model_projection = nn.Linear(
@@ -537,13 +549,11 @@ class Gemma3Model(nn.Module):
         cache=None,
         **kwargs
     ):
-        per_layer_inputs = kwargs.get("per_layer_inputs")
+        per_layer_inputs = kwargs.get("per_layer_inputs", None)
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
-
-        h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
         if per_layer_inputs is None and inputs is not None:
             per_layer_inputs = self.get_per_layer_inputs(inputs)
@@ -559,8 +569,8 @@ class Gemma3Model(nn.Module):
             sliding_window_mask = create_attention_mask(h, cache)
 
         h0 = h
-        # Expand hidden_states to support per-layer inputs
 
+        # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
         epsilon_tensor = mx.finfo(mx.float16).min
 
@@ -608,7 +618,7 @@ class Gemma3Model(nn.Module):
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens).reshape(
             *input_ids.shape, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
-        ) * mx.array(self.config.hidden_size**0.5, mx.bfloat16)
+        )
         return result.astype(input_ids.dtype)
 
     def project_per_layer_inputs(
