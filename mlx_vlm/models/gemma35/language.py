@@ -28,15 +28,16 @@ class TextConfig:
     altup_coef_clip: Optional[float] = None
     altup_correct_scale: bool = True
     hidden_size_per_layer_input: int = 1024
-    rope_global_base_freq: float = 1_000_000.0
-    rope_local_base_freq: float = 10_000.0
+    rope_local_base_freq: float = 10000.0
     rope_traditional: bool = False
+    rope_theta: float = 1000000.0
     query_pre_attn_scalar: float = 0.0625
     sliding_window: int = 1024
     rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
     mm_tokens_per_image: int = 256
     sliding_window_pattern: int = 5
     activation_sparsity_pattern: Optional[List[float]] = None
+    final_logit_softcapping: float = 1.0
 
     @classmethod
     def from_dict(cls, params):
@@ -55,7 +56,6 @@ class Gemma3p5EinsumLayer(nn.Module):
         shape: Sequence[int],
         einsum_str: str,
         *args,
-        weight_init: Optional[Callable[..., mx.array]] = None,
         **kwargs,
     ):
         if "->" not in einsum_str:
@@ -104,10 +104,8 @@ class Gemma3p5RMSNorm(nn.Module):
         if self.scale_shift != 0.0:
             scale += self.scale_shift
 
-        output = self._norm(x)
-        # Llama does x.astype(mx.float16) * w whilst Gemma2 is (x * w).astype(mx.float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        output = output * scale
+        output = mx.fast.rms_norm(x, scale, eps=self.eps)
+
         return output.astype(x.dtype)
 
 
@@ -132,7 +130,7 @@ class Gemma3p5LaurelBlock(nn.Module):
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             scale_shift=0.0,
-            with_scale=False,
+            with_scale=True,
         )
 
     def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
@@ -176,11 +174,7 @@ class Gemma3p5Attention(nn.Module):
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
-            base=(
-                config.rope_local_base_freq
-                if self.is_kv_shared_layer
-                else config.rope_global_base_freq
-            ),
+            base=config.rope_theta if self.is_kv_shared_layer else config.rope_local_base_freq
         )
 
 
@@ -191,21 +185,25 @@ class Gemma3p5Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries = self.q_proj(x)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         queries = self.qkv_norm(queries)
-        queries = self.rope(queries)
-
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
 
-        if self.is_kv_shared_layer and cache is not None:
+        keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        keys = self.qkv_norm(keys)
+
+        values = self.v_proj(x).reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = self.qkv_norm(values)
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            keys = self.qkv_norm(keys)
+            queries = self.rope(queries)
             keys = self.rope(keys)
-            values = self.qkv_norm(values)
+
 
         # Sliding window
         if self.is_kv_shared_layer and mask is not None and isinstance(mask, mx.array):
@@ -371,21 +369,6 @@ class Gemma3p5AltUp(nn.Module):
         return corrected
 
 
-@partial(mx.compile, shapeless=True)
-def clip_residual(x, y=None):
-    bound = mx.finfo(mx.float16).max
-    if y is None:
-        if x.dtype == mx.float16:
-            return mx.clip(x.astype(mx.float32), -bound, bound).astype(mx.float16)
-        else:
-            return x
-
-    if x.dtype != mx.float16:
-        return x + y
-
-    return mx.clip(x.astype(mx.float32) + y.astype(mx.float32), -bound, bound).astype(
-        mx.float16
-    )
 
 
 class Gemma3p5DecoderLayer(nn.Module):
@@ -418,7 +401,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
         self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
         self.post_per_layer_input_norm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_laurel_norm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_laurel_norm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=False)
 
 
     def __call__(
@@ -615,7 +598,7 @@ class Gemma3Model(nn.Module):
         result = self.embed_tokens_per_layer(tokens).reshape(
             *input_ids.shape, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
         )
-        return result.astype(input_ids.dtype)
+        return result
 
     def project_per_layer_inputs(
         self, inputs_embeds: mx.array, per_layer_inputs: Optional[mx.array] = None
@@ -643,7 +626,7 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.model = Gemma3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.final_logit_softcapping = config.final_logit_softcapping
     def __call__(
         self,
         inputs: mx.array=None,
@@ -653,10 +636,11 @@ class LanguageModel(nn.Module):
     ):
         out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
         out = self.lm_head(out)
+        out = mx.tanh(out / self.final_logit_softcapping)
+        out = out * self.final_logit_softcapping
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-
         if "lm_head.weight" not in weights:
             weights["language_model.lm_head.weight"] = weights[
                 "language_model.model.embed_tokens.weight"
