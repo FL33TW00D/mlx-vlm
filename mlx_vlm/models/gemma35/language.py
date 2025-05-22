@@ -91,31 +91,19 @@ class Gemma3p5RMSNorm(nn.Module):
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
-
+        self.dim = dim
         if self.with_scale:
-            self.weight = mx.ones(dim)
-        else:
-            self.weight = None
+            self.weight = mx.ones((dim,))
 
-    def _norm(self, x: mx.array) -> mx.array:
-        return x * mx.rsqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
+    def _norm(self, x):
+        return x / mx.sqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self._guard_against_excess_precision(x)
-        if not self.with_scale:
-            self.weight = mx.array(1.0)
-
-        output = self._norm(x) * (self.weight + self.scale_shift).astype(x.dtype)
-        return output.astype(x.dtype)
-
+        weight = self.weight if self.with_scale else mx.ones((self.dim,))
+        return mx.fast.rms_norm(x, weight + self.scale_shift, self.eps)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-    def _guard_against_excess_precision(self, x: mx.array) -> mx.array:
-        # TODO(ryanmullins): Implement Torch equivalent to jax.lax.reduce_precision
-        return x
-
 
 class Gemma3p5LaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
@@ -134,11 +122,10 @@ class Gemma3p5LaurelBlock(nn.Module):
         )
 
     def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
-        laurel_x = self.linear_left(x)
-        laurel_x = self.linear_right(laurel_x)
-        normed_laurel_x = self.post_laurel_norm(laurel_x)
-        x = x + normed_laurel_x
-        return x
+        laurel_x: mx.array = self.linear_left(x)
+        laurel_x: mx.array = self.linear_right(laurel_x)
+        normed_laurel_x: mx.array = self.post_laurel_norm(laurel_x)
+        return x + normed_laurel_x
 
 
 class Gemma3p5Attention(nn.Module):
@@ -220,6 +207,9 @@ class Gemma3p5Attention(nn.Module):
             values = self.v_proj(x).reshape(hidden_shape)
             values = self.qkv_norm(values)
             values = values.transpose(0, 2, 1, 3)
+
+            # print(f"In non-shared layer {self.layer_idx} ---> ", keys.shape, values.shape)
+
 
         if cache is not None:
             # print(f"Before cache update {self.layer_idx} ->", keys.shape, values.shape, cache.offset, isinstance(cache, RotatingKVCache))
@@ -325,40 +315,35 @@ class Gemma3p5AltUp(nn.Module):
             scale_shift=0.0,
             with_scale=True,
         )
-
+        self._router_input_scale = mx.array(self.config.hidden_size**-1.0)
 
     def compute_router_modalities(self, x: mx.array) -> mx.array:
-        x_norm: mx.array = self.router_norm(x)
-        router_inputs: mx.array = x_norm * self.config.hidden_size**-1.0
+        router_inputs = self.router_norm(x) * self._router_input_scale.astype(self.router_norm.weight.dtype)
         # routed adapted from jax.numpy.einsum("btf,fd->btd", ...)
-        routed: mx.array = self.modality_router(router_inputs)
+        routed = self.modality_router(router_inputs).astype(mx.float32)
         return mx.tanh(routed)
 
-    def predict(self, x: List[mx.array]) -> List[mx.array]:
+    def predict(self, x: mx.array) -> mx.array:
         modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
+        self.prediction_coefs.weight = self.prediction_coefs.weight.astype(mx.float32)
 
         if self.config.altup_coef_clip is not None:
             self.prediction_coefs.weight = mx.clip(self.prediction_coefs.weight, -self.config.altup_coef_clip, self.config.altup_coef_clip)
 
-
         # all_coefs adapted from jax.numpy.einsum("...p,pij->...ij", ...)
-        all_coefs: mx.array = self.prediction_coefs(modalities)
-        all_coefs = all_coefs.reshape(
-            *modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs
+        # Project and then transpose all 2D matrices contained so that mulmat gives the correct result
+        all_coefs: mx.array = (
+            self.prediction_coefs(modalities)
+            .reshape(*modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs)
+            .transpose(0, 1, 3, 2)
         )
 
-        outputs: list[mx.array] = [mx.zeros_like(x[0])] * self.config.altup_num_inputs
-        for i in range(self.config.altup_num_inputs):
-            output = outputs[i]
+        # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
+        predictions = mx.matmul(x.transpose(1, 2, 3, 0), all_coefs)
+        predictions = predictions.transpose(3, 0, 1, 2)  # undo the permute
+        predictions += x  # add the original input
+        return predictions.astype(x.dtype)
 
-            for j in range(self.config.altup_num_inputs):
-                coef = mx.expand_dims(all_coefs[..., i, j], axis=-1)
-                output += coef * x[j]
-
-            x_i = x[i]
-            outputs[i] = (x_i + output).astype(x_i.dtype)
-
-        return outputs
 
     def correct(self, predictions: List[mx.array], activated: mx.array):
         modalities = self.compute_router_modalities(activated)
@@ -385,8 +370,10 @@ class Gemma3p5AltUp(nn.Module):
     def __call__(self, x: List[mx.array], activated: mx.array):
         predictions = self.predict(x)
         corrected = self.correct(predictions=predictions, activated=activated)
-        return corrected
-
+        output = corrected[self.config.altup_active_idx]
+        if self.config.altup_correct_scale:
+            output = self.scale_corrected_output(output)
+        return corrected, output
 
 
 
@@ -408,14 +395,21 @@ class Gemma3p5DecoderLayer(nn.Module):
             scale_shift=0.0,
             with_scale=True,
         )
-        self.post_attention_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Gemma3p5RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+        )
+        self.pre_feedforward_layernorm = Gemma3p5RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+        )
+        self.post_feedforward_layernorm = Gemma3p5RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+        )
+
         self.sliding_window = config.sliding_window
         self.is_sliding = self.self_attn.is_sliding
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
-        self.act_fn = nn.GELU()
+
 
         self.altup = Gemma3p5AltUp(config)
         self.laurel = Gemma3p5LaurelBlock(config)
@@ -432,6 +426,8 @@ class Gemma3p5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
     ):
+        if isinstance(x, list):
+            x = mx.stack(x, axis=0)
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -439,12 +435,13 @@ class Gemma3p5DecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
-
         attn = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
         )
+
+
         attn = self.post_attention_layernorm(attn)
 
         attn_gated = active_prediction + attn
@@ -462,7 +459,7 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         # per_layer_input_gate adapted from jax.numpy.einsum("btd,dp->btp", ...)
         first_prediction = self.per_layer_input_gate(first_prediction)
-        first_prediction = self.act_fn(first_prediction)
+        first_prediction = nn.gelu_approx(first_prediction)
         first_prediction = mx.multiply(first_prediction, per_layer_input)
 
         # per_layer_projection adapted from jax.numpy.einsum("btp,pd->btd", ...)
@@ -573,7 +570,7 @@ class Gemma3Model(nn.Module):
 
         h = mx.stack(h, axis=0)
 
-        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+        for i, (layer, c) in enumerate(zip(self.layers[ : self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             is_global = bool((i + 1) % self.config.sliding_window_pattern == 0)
@@ -680,13 +677,13 @@ class LanguageModel(nn.Module):
             if bool((i + 1) % self.config.sliding_window_pattern == 0):
                 caches.append(
                     SlidingWindowCache(
-                        max_size=min(self.config.sliding_window, self.config.sliding_window_pattern),
+                        max_size=114,
                     )
                 )
             else:
                 caches.append(
                     StaticKVCache(
-                        max_size=self.config.sliding_window,
+                        max_size=114,
                     )
                 )
         return caches
