@@ -179,10 +179,17 @@ class Gemma3p5Attention(nn.Module):
         else:
             # The last layer before sharing starts is always the last that computes global attention layer
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
+
+        rope_scale = 1.0
+        if config.rope_scaling and config.rope_scaling["type"] == "linear":
+            assert isinstance(config.rope_scaling["factor"], float)
+            rope_scale = 1 / config.rope_scaling["factor"]
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
-            base=config.rope_theta if self.is_kv_shared_layer else config.rope_local_base_freq
+            base=config.rope_theta if self.is_kv_shared_layer else config.rope_local_base_freq,
+            scale=rope_scale
+
         )
 
 
@@ -198,7 +205,7 @@ class Gemma3p5Attention(nn.Module):
         queries = queries.reshape(hidden_shape)
         queries = self.qkv_norm(queries)
 
-        queries = self.rope(queries) if cache is None else self.rope(queries, cache.offset)
+        queries = self.rope(queries) if cache is None else self.rope(queries, offset=cache.offset)
         queries = queries.transpose(0, 2, 1, 3)
 
         if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and cache is not None and cache.offset > 0:
@@ -208,8 +215,8 @@ class Gemma3p5Attention(nn.Module):
             keys = self.qkv_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
 
-            keys = self.rope(keys) if cache is None else self.rope(keys, cache.offset)
-            
+            keys = self.rope(keys) if cache is None else self.rope(keys, offset=cache.offset)
+
             values = self.v_proj(x).reshape(hidden_shape)
             values = self.qkv_norm(values)
             values = values.transpose(0, 2, 1, 3)
@@ -221,8 +228,6 @@ class Gemma3p5Attention(nn.Module):
             # print("="*100)
             # print(f"k: {keys}")
             # print("="*100)
-
-
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -443,7 +448,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         attn = self.post_attention_layernorm(attn)
 
         attn_gated = active_prediction + attn
-        attn_laurel = (attn_gated + laurel_output) / mx.sqrt(mx.array(2.0))
+        attn_laurel = (attn_gated + laurel_output) / mx.sqrt(mx.array(2.0, dtype=active_prediction.dtype))
 
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
         attn_ffw = self.mlp(attn_norm)
@@ -534,6 +539,7 @@ class Gemma3Model(nn.Module):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
+
         else:
             h = inputs_embeds
 
@@ -578,6 +584,7 @@ class Gemma3Model(nn.Module):
                 local_mask = sliding_window_mask
 
             h = layer(h, local_mask, c, per_layer_input)
+
 
          # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
@@ -668,7 +675,6 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         caches = []
-
 
         for i in range(self.config.num_hidden_layers):
             if bool((i + 1) % self.config.sliding_window_pattern == 0):
