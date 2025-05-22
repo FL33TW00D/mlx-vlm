@@ -1,10 +1,11 @@
 import inspect
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache, RotatingKVCache
@@ -196,37 +197,32 @@ class Gemma3p5Attention(nn.Module):
         queries = self.q_proj(x)
         queries = queries.reshape(hidden_shape)
         queries = self.qkv_norm(queries)
-        if cache is not None:
-            queries = self.rope(queries, cache.offset)
-        else:
-            queries = self.rope(queries)
+
+        queries = self.rope(queries) if cache is None else self.rope(queries, cache.offset)
         queries = queries.transpose(0, 2, 1, 3)
 
         if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and cache is not None and cache.offset > 0:
             keys, values = cache.state
-
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
-            if cache is not None:
-                keys = self.rope(keys, cache.offset)
-            else:
-                keys = self.rope(keys)
 
+            keys = self.rope(keys) if cache is None else self.rope(keys, cache.offset)
+            
             values = self.v_proj(x).reshape(hidden_shape)
             values = self.qkv_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
         if cache is not None:
+            # print(f"Before cache update {self.layer_idx} ->", keys.shape, values.shape, cache.offset, isinstance(cache, RotatingKVCache))
             keys, values = cache.update_and_fetch(keys, values)
+            # print(f"After cache update {self.layer_idx} ->", keys.shape, values.shape)
+            # print("="*100)
+            # print(f"k: {keys}")
+            # print("="*100)
 
 
-            # # Sliding window
-            # if self.is_sliding and mask is not None and isinstance(mask, mx.array):
-
-            #     if mask.shape[-1] != keys.shape[-2]:
-            #         mask = mask[..., -keys.shape[-2] :]
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -574,10 +570,7 @@ class Gemma3Model(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-            is_global = (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            )
+            is_global = bool((i + 1) % self.config.sliding_window_pattern == 0)
             local_mask = mask
             if mask is None and is_global:
                 local_mask = full_mask
@@ -678,16 +671,193 @@ class LanguageModel(nn.Module):
 
 
         for i in range(self.config.num_hidden_layers):
-            if (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            ):
-                caches.append(KVCache())
+            if bool((i + 1) % self.config.sliding_window_pattern == 0):
+                caches.append(
+                    SlidingWindowCache(
+                        max_size=min(self.config.sliding_window, self.config.sliding_window_pattern),
+                    )
+                )
             else:
                 caches.append(
-                    RotatingKVCache(
-                        max_size=self.config.sliding_window_pattern,
-                        keep=0,
+                    StaticKVCache(
+                        max_size=self.config.sliding_window,
                     )
                 )
         return caches
+
+class SlidingWindowCache(_BaseCache):
+    """
+    A sliding window cache that maintains a fixed-size buffer with zero padding.
+    Similar to PyTorch's sliding window behavior but for MLX.
+    """
+
+    def __init__(self, max_size: int, step: int = 256):
+        self.max_size = max_size
+        self.step = step
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array) -> Tuple[mx.array, mx.array]:
+        B, n_kv_heads, seq_len, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+
+        # If cache doesn't exist or needs expansion, create/expand it
+        if self.keys is None:
+            # Create cache with fixed size (max_size)
+            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
+            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
+            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
+            self.values = mx.zeros(v_shape, dtype=values.dtype)
+
+        # Handle case where input sequence is longer than max_size
+        if seq_len > self.max_size:
+            # Take only the last max_size tokens
+            keys_to_store = keys[:, :, -self.max_size:, :]
+            values_to_store = values[:, :, -self.max_size:, :]
+            self.keys = keys_to_store
+            self.values = values_to_store
+            self.offset = self.max_size
+            return keys, values  # Return full input for attention computation
+
+        # Calculate positions for sliding window logic
+        if self.offset + seq_len <= self.max_size:
+            # Simple case: just append to cache
+            self.keys = mx.concatenate([
+                self.keys[:, :, :self.offset, :],
+                keys,
+                self.keys[:, :, self.offset + seq_len:, :]
+            ], axis=2)
+            self.values = mx.concatenate([
+                self.values[:, :, :self.offset, :],
+                values,
+                self.values[:, :, self.offset + seq_len:, :]
+            ], axis=2)
+            self.offset += seq_len
+        else:
+            # Sliding window case: need to shift and add new tokens
+            shift_amount = (self.offset + seq_len) - self.max_size
+
+            # Shift existing cache left
+            if shift_amount < self.max_size:
+                self.keys = mx.concatenate([
+                    self.keys[:, :, shift_amount:, :],
+                    mx.zeros((B, n_kv_heads, shift_amount, k_head_dim), dtype=keys.dtype)
+                ], axis=2)
+                self.values = mx.concatenate([
+                    self.values[:, :, shift_amount:, :],
+                    mx.zeros((B, n_kv_heads, shift_amount, v_head_dim), dtype=values.dtype)
+                ], axis=2)
+            else:
+                # Complete replacement
+                self.keys = mx.zeros((B, n_kv_heads, self.max_size, k_head_dim), dtype=keys.dtype)
+                self.values = mx.zeros((B, n_kv_heads, self.max_size, v_head_dim), dtype=values.dtype)
+
+            # Add new tokens
+            start_pos = self.max_size - seq_len
+            self.keys = mx.concatenate([
+                self.keys[:, :, :start_pos, :],
+                keys
+            ], axis=2)
+            self.values = mx.concatenate([
+                self.values[:, :, :start_pos, :],
+                values
+            ], axis=2)
+            self.offset = self.max_size
+
+        # Return the portion of cache that contains data (with trailing zeros)
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        if v is not None and len(v) == 2:
+            self.keys, self.values = v
+            if self.keys is not None:
+                self.offset = self.max_size
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.max_size, self.step, self.offset)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size, self.step, self.offset = map(int, v)
+
+    def is_trimmable(self):
+        return False  # Sliding window cache doesn't support trimming
+
+    def trim(self, n):
+        return 0  # No trimming for sliding window
+
+
+class StaticKVCache(_BaseCache):
+    """
+    A static cache that grows to accommodate all tokens, similar to regular KVCache
+    but with a maximum size limit and zero padding.
+    """
+
+    def __init__(self, max_size: int, step: int = 256):
+        self.max_size = max_size
+        self.step = step
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array) -> Tuple[mx.array, mx.array]:
+        B, n_kv_heads, seq_len, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+
+        # Initialize cache if needed
+        if self.keys is None:
+            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
+            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
+            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
+            self.values = mx.zeros(v_shape, dtype=values.dtype)
+
+        # Update cache
+        end_pos = min(self.offset + seq_len, self.max_size)
+        actual_seq_len = end_pos - self.offset
+
+        if actual_seq_len > 0:
+            self.keys = mx.concatenate([self.keys[:, :, :self.offset, :], keys[:, :, :actual_seq_len, :], self.keys[:, :, end_pos:, :]], axis=2)
+            self.values = mx.concatenate([self.values[:, :, :self.offset, :], values[:, :, :actual_seq_len, :], self.values[:, :, end_pos:, :]], axis=2)
+            self.offset = end_pos
+
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, v):
+        if v is not None and len(v) == 2:
+            self.keys, self.values = v
+            if self.keys is not None:
+                # Calculate offset based on non-zero entries
+                self.offset = self.max_size
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.max_size, self.step, self.offset)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size, self.step, self.offset = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
