@@ -3,11 +3,12 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union, Tuple
 
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
 from ..cache import KVCache, RotatingKVCache
 
 
@@ -77,8 +78,6 @@ class Gemma3p5EinsumLayer(nn.Module):
         return mx.einsum(self.einsum_str, x, self.weight)
 
 
-
-
 class Gemma3p5RMSNorm(nn.Module):
     def __init__(
         self,
@@ -99,7 +98,7 @@ class Gemma3p5RMSNorm(nn.Module):
         return x / mx.sqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        weight = self.weight if self.with_scale else mx.ones((self.dim,))
+        weight = self.weight if self.with_scale else mx.ones((self.dim,), dtype=x.dtype)
         return mx.fast.rms_norm(x, weight + self.scale_shift, self.eps)
 
     def extra_repr(self):
@@ -131,7 +130,7 @@ class Gemma3p5LaurelBlock(nn.Module):
 class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern == 0)
+        self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
 
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
@@ -167,16 +166,11 @@ class Gemma3p5Attention(nn.Module):
             # The last layer before sharing starts is always the last that computes global attention layer
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
 
-        rope_scale = 1.0
-        if config.rope_scaling and config.rope_scaling["type"] == "linear":
-            assert isinstance(config.rope_scaling["factor"], float)
-            rope_scale = 1 / config.rope_scaling["factor"]
+
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
-            base=config.rope_theta if self.is_kv_shared_layer else config.rope_local_base_freq,
-            scale=rope_scale
-
+            base=config.rope_local_base_freq if self.is_sliding else config.rope_theta,
         )
 
 
@@ -200,9 +194,8 @@ class Gemma3p5Attention(nn.Module):
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
-            keys = keys.transpose(0, 2, 1, 3)
-
             keys = self.rope(keys) if cache is None else self.rope(keys, offset=cache.offset)
+            keys = keys.transpose(0, 2, 1, 3)
 
             values = self.v_proj(x).reshape(hidden_shape)
             values = self.qkv_norm(values)
@@ -435,16 +428,16 @@ class Gemma3p5DecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
+
         attn = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
         )
-
-
         attn = self.post_attention_layernorm(attn)
 
         attn_gated = active_prediction + attn
+
         attn_laurel = (attn_gated + laurel_output) / mx.sqrt(mx.array(2.0, dtype=active_prediction.dtype))
 
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
@@ -548,10 +541,11 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.config.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
+        mask = None
+        j = self.config.sliding_window_pattern
+        full_mask = create_attention_mask(h, cache[j - 1 : j])
+        sliding_window_mask = create_attention_mask(h, cache)
+
 
         h0 = h
 
@@ -676,23 +670,20 @@ class LanguageModel(nn.Module):
         for i in range(self.config.num_hidden_layers):
             if bool((i + 1) % self.config.sliding_window_pattern == 0):
                 caches.append(
-                    SlidingWindowCache(
-                        max_size=114,
+                    StaticKVCache(
+                        max_size=self.config.sliding_window,
                     )
                 )
             else:
                 caches.append(
-                    StaticKVCache(
-                        max_size=114,
+                    SlidingWindowCache(
+                        max_size=self.config.sliding_window,
                     )
                 )
         return caches
 
 class SlidingWindowCache(_BaseCache):
-    """
-    A sliding window cache that maintains a fixed-size buffer with zero padding.
-    Similar to PyTorch's sliding window behavior but for MLX.
-    """
+    """A sliding window cache for local attention layers."""
 
     def __init__(self, max_size: int, step: int = 256):
         self.max_size = max_size
@@ -705,70 +696,37 @@ class SlidingWindowCache(_BaseCache):
         B, n_kv_heads, seq_len, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
 
-        # If cache doesn't exist or needs expansion, create/expand it
         if self.keys is None:
-            # Create cache with fixed size (max_size)
+            # Initialize cache
             k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
             v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
             self.keys = mx.zeros(k_shape, dtype=keys.dtype)
             self.values = mx.zeros(v_shape, dtype=values.dtype)
 
-        # Handle case where input sequence is longer than max_size
-        if seq_len > self.max_size:
-            # Take only the last max_size tokens
-            keys_to_store = keys[:, :, -self.max_size:, :]
-            values_to_store = values[:, :, -self.max_size:, :]
-            self.keys = keys_to_store
-            self.values = values_to_store
-            self.offset = self.max_size
-            return keys, values  # Return full input for attention computation
-
-        # Calculate positions for sliding window logic
+        # Simple sliding window: keep only the last max_size tokens
         if self.offset + seq_len <= self.max_size:
-            # Simple case: just append to cache
-            self.keys = mx.concatenate([
-                self.keys[:, :, :self.offset, :],
-                keys,
-                self.keys[:, :, self.offset + seq_len:, :]
-            ], axis=2)
-            self.values = mx.concatenate([
-                self.values[:, :, :self.offset, :],
-                values,
-                self.values[:, :, self.offset + seq_len:, :]
-            ], axis=2)
+            # Fits within current window
+            start_idx = self.offset
+            end_idx = self.offset + seq_len
+            self.keys[:, :, start_idx:end_idx, :] = keys
+            self.values[:, :, start_idx:end_idx, :] = values
             self.offset += seq_len
         else:
-            # Sliding window case: need to shift and add new tokens
-            shift_amount = (self.offset + seq_len) - self.max_size
-
-            # Shift existing cache left
+            # Need to slide the window
+            # Shift existing content left
+            shift_amount = seq_len
             if shift_amount < self.max_size:
-                self.keys = mx.concatenate([
-                    self.keys[:, :, shift_amount:, :],
-                    mx.zeros((B, n_kv_heads, shift_amount, k_head_dim), dtype=keys.dtype)
-                ], axis=2)
-                self.values = mx.concatenate([
-                    self.values[:, :, shift_amount:, :],
-                    mx.zeros((B, n_kv_heads, shift_amount, v_head_dim), dtype=values.dtype)
-                ], axis=2)
+                self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
+                self.values[:, :, :-shift_amount, :] = self.values[:, :, shift_amount:, :]
+                # Add new tokens at the end
+                self.keys[:, :, -shift_amount:, :] = keys
+                self.values[:, :, -shift_amount:, :] = values
             else:
-                # Complete replacement
-                self.keys = mx.zeros((B, n_kv_heads, self.max_size, k_head_dim), dtype=keys.dtype)
-                self.values = mx.zeros((B, n_kv_heads, self.max_size, v_head_dim), dtype=values.dtype)
-
-            # Add new tokens
-            start_pos = self.max_size - seq_len
-            self.keys = mx.concatenate([
-                self.keys[:, :, :start_pos, :],
-                keys
-            ], axis=2)
-            self.values = mx.concatenate([
-                self.values[:, :, :start_pos, :],
-                values
-            ], axis=2)
+                # New sequence is larger than cache, just keep the last max_size tokens
+                self.keys = keys[:, :, -self.max_size:, :]
+                self.values = values[:, :, -self.max_size:, :]
             self.offset = self.max_size
 
-        # Return the portion of cache that contains data (with trailing zeros)
         return self.keys, self.values
 
     @property
@@ -800,10 +758,7 @@ class SlidingWindowCache(_BaseCache):
 
 
 class StaticKVCache(_BaseCache):
-    """
-    A static cache that grows to accommodate all tokens, similar to regular KVCache
-    but with a maximum size limit and zero padding.
-    """
+    """A static cache that grows to accommodate all tokens."""
 
     def __init__(self, max_size: int, step: int = 256):
         self.max_size = max_size
