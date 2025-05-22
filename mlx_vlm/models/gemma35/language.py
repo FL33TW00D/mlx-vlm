@@ -31,7 +31,7 @@ class TextConfig:
     altup_correct_scale: bool = True
     hidden_size_per_layer_input: int = 1024
     rope_local_base_freq: float = 10000.0
-    rope_traditional: bool = False
+    rope_traditional: bool = True
     rope_theta: float = 1000000.0
     query_pre_attn_scalar: float = 0.0625
     sliding_window: int = 1024
@@ -42,6 +42,7 @@ class TextConfig:
     final_logit_softcapping: float = 1.0
     query_rescale_scalar: float = 1.0
     num_kv_shared_layers: int = 0
+    max_position_embeddings: int = 32768
 
     @classmethod
     def from_dict(cls, params):
@@ -130,7 +131,7 @@ class Gemma3p5LaurelBlock(nn.Module):
 class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
+        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
 
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
@@ -179,6 +180,7 @@ class Gemma3p5Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        caches: Optional[List[Any]] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -190,7 +192,8 @@ class Gemma3p5Attention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
 
         if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and cache is not None and cache.offset > 0:
-            keys, values = cache.state
+            # For shared layers, retrieve KV from the designated cache layer
+            keys, values = caches[self.kv_shared_layer_index].state
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
@@ -201,16 +204,8 @@ class Gemma3p5Attention(nn.Module):
             values = self.qkv_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
-            # print(f"In non-shared layer {self.layer_idx} ---> ", keys.shape, values.shape)
-
-
-        if cache is not None:
-            # print(f"Before cache update {self.layer_idx} ->", keys.shape, values.shape, cache.offset, isinstance(cache, RotatingKVCache))
-            keys, values = cache.update_and_fetch(keys, values)
-            # print(f"After cache update {self.layer_idx} ->", keys.shape, values.shape)
-            # print("="*100)
-            # print(f"k: {keys}")
-            # print("="*100)
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
 
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
@@ -338,7 +333,7 @@ class Gemma3p5AltUp(nn.Module):
         return predictions.astype(x.dtype)
 
 
-    def correct(self, predictions: List[mx.array], activated: mx.array):
+    def correct(self, predictions: mx.array, activated: mx.array):
         modalities = self.compute_router_modalities(activated)
 
         if self.config.altup_coef_clip is not None:
@@ -349,7 +344,7 @@ class Gemma3p5AltUp(nn.Module):
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        corrected = [mx.zeros_like(predictions[0])] * self.config.altup_num_inputs
+        corrected = mx.zeros_like(predictions)
         for i in range(self.config.altup_num_inputs):
             coef = mx.expand_dims(all_coefs[..., i] + 1, axis=-1)
             corrected[i] = (predictions[i] + coef * innovation).astype(activated.dtype)
@@ -360,7 +355,7 @@ class Gemma3p5AltUp(nn.Module):
         scale = self.correct_output_scale if self.config.altup_correct_scale else 1.0
         return corrected * scale
 
-    def __call__(self, x: List[mx.array], activated: mx.array):
+    def __call__(self, x: mx.array, activated: mx.array):
         predictions = self.predict(x)
         corrected = self.correct(predictions=predictions, activated=activated)
         output = corrected[self.config.altup_active_idx]
@@ -381,7 +376,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = Gemma3p5Attention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx)
         self.input_layernorm = Gemma3p5RMSNorm(
             dim=self.hidden_size,
             eps=config.rms_norm_eps,
@@ -418,6 +413,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
+        caches: Optional[List[Any]] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
@@ -433,6 +429,7 @@ class Gemma3p5DecoderLayer(nn.Module):
             active_prediction_normed,
             mask,
             cache,
+            caches,
         )
         attn = self.post_attention_layernorm(attn)
 
@@ -541,10 +538,10 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = None
-        j = self.config.sliding_window_pattern
-        full_mask = create_attention_mask(h, cache[j - 1 : j])
-        sliding_window_mask = create_attention_mask(h, cache)
+        if mask is None:
+            j = self.config.sliding_window_pattern
+            full_mask = create_attention_mask(h, cache[j - 1 : j])
+            sliding_window_mask = create_attention_mask(h, cache)
 
 
         h0 = h
@@ -567,14 +564,18 @@ class Gemma3Model(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers[ : self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-            is_global = bool((i + 1) % self.config.sliding_window_pattern == 0)
+            is_global = (
+                i % self.config.sliding_window_pattern
+                == self.config.sliding_window_pattern - 1
+            )
+
             local_mask = mask
             if mask is None and is_global:
                 local_mask = full_mask
             elif mask is None:
                 local_mask = sliding_window_mask
 
-            h = layer(h, local_mask, c, per_layer_input)
+            h = layer(h, local_mask, c, per_layer_input, cache)
 
 
          # Per-layer inputs to single output
@@ -668,7 +669,11 @@ class LanguageModel(nn.Module):
         caches = []
 
         for i in range(self.config.num_hidden_layers):
-            if bool((i + 1) % self.config.sliding_window_pattern == 0):
+
+            if (
+                i % self.config.sliding_window_pattern
+                == self.config.sliding_window_pattern - 1
+            ):
                 caches.append(
                     StaticKVCache(
                         max_size=self.config.sliding_window,
@@ -680,6 +685,22 @@ class LanguageModel(nn.Module):
                         max_size=self.config.sliding_window,
                     )
                 )
+
+            # if (
+            #     i % self.config.sliding_window_pattern
+            #     == self.config.sliding_window_pattern - 1
+            # ):
+            #     caches.append(
+            #         KVCache()
+            #     )
+            # else:
+            #     caches.append(
+            #         RotatingKVCache(
+            #             max_size=self.config.sliding_window,
+            #             keep=0
+            #         )
+            #     )
+
         return caches
 
 class SlidingWindowCache(_BaseCache):
