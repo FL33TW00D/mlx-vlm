@@ -55,60 +55,45 @@ class TextConfig:
         )
 
 
-class Gemma3p5EinsumLayer(nn.Module):
-    def __init__(
-        self,
-        shape: Sequence[int],
-        einsum_str: str,
-        *args,
-        **kwargs,
-    ):
-        if "->" not in einsum_str:
-            raise ValueError("Einsum must contain '->'")
-
-        if len(einsum_str.split("->")[0].split(",")) != 2:
-            raise ValueError("Need to have exactly two inputs in einsum instruction")
-
-        super().__init__(*args, **kwargs)
-        self.shape = shape
-        self.einsum_str = einsum_str
-
-        self.weight = mx.ones(shape)
-
-    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
-        return mx.einsum(self.einsum_str, x, self.weight)
-
-
 class Gemma3p5RMSNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        scale_shift: float = 1.0,
-        with_scale: bool = True,
-    ):
-        super().__init__()
+    def __init__(self, dim: int, eps: float = 1e-6, scale_shift: float = 1.0, with_scale: bool = True):
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
-        self.dim = dim
         if self.with_scale:
-            self.weight = mx.ones((dim,))
-
-    def _norm(self, x):
-        return x / mx.sqrt(mx.mean(x**2, axis=-1, keepdims=True) + self.eps)
+            self.weight = mx.ones(dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        weight = self.weight if self.with_scale else mx.ones((self.dim,), dtype=x.dtype)
-        return mx.fast.rms_norm(x, weight + self.scale_shift, self.eps)
+        # Compute variance along last dimension
+        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
+        # Normalize
+        normed = x / mx.sqrt(variance + self.eps)
+
+        # Apply weight scaling
+        if self.with_scale:
+            weight = self.weight
+        else:
+            weight = mx.ones(x.shape[-1], dtype=x.dtype)
+
+        scaled_weight = weight + self.scale_shift
+        output = normed * scaled_weight
+
+        return output
+
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
+
+
+
+
+
+
 class Gemma3p5LaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
 
-    def __init__(self, config: TextConfig, *args, **kwargs):
+    def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
 
@@ -121,10 +106,10 @@ class Gemma3p5LaurelBlock(nn.Module):
             with_scale=True,
         )
 
-    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
-        laurel_x: mx.array = self.linear_left(x)
-        laurel_x: mx.array = self.linear_right(laurel_x)
-        normed_laurel_x: mx.array = self.post_laurel_norm(laurel_x)
+    def __call__(self, x: mx.array) -> mx.array:
+        laurel_x = self.linear_left(x)
+        laurel_x = self.linear_right(laurel_x)
+        normed_laurel_x = self.post_laurel_norm(laurel_x)
         return x + normed_laurel_x
 
 
@@ -167,13 +152,11 @@ class Gemma3p5Attention(nn.Module):
             # The last layer before sharing starts is always the last that computes global attention layer
             self.kv_shared_layer_index = first_kv_shared_layer_idx - 1
 
-
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
             base=config.rope_local_base_freq if self.is_sliding else config.rope_theta,
         )
-
 
     def __call__(
         self,
@@ -181,19 +164,21 @@ class Gemma3p5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
+        cache_position: Optional[mx.array] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+
         queries = self.q_proj(x)
         queries = queries.reshape(hidden_shape)
         queries = self.qkv_norm(queries)
-
         queries = self.rope(queries) if cache is None else self.rope(queries, offset=cache.offset)
         queries = queries.transpose(0, 2, 1, 3)
 
-        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and cache is not None and cache.offset > 0:
+        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and caches is not None and cache is not None and cache.offset > 0:
             # For shared layers, retrieve KV from the designated cache layer
-            keys, values = caches[self.kv_shared_layer_index].state
+            shared_cache = caches[self.kv_shared_layer_index]
+            keys, values = shared_cache.state
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
@@ -207,6 +192,11 @@ class Gemma3p5Attention(nn.Module):
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
+
+        # Sliding window mask
+        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
+            mask = mask[..., -keys.shape[-2] :]
+
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
@@ -215,7 +205,7 @@ class Gemma3p5Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int = 0, *args, **kwargs):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -223,7 +213,6 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        self.act_fn = nn.GELU()
         if config.activation_sparsity_pattern is not None:
             self.activation_sparsity = config.activation_sparsity_pattern[layer_idx]
         else:
@@ -233,67 +222,29 @@ class MLP(nn.Module):
         gate_proj = self.gate_proj(x)
         if self.activation_sparsity > 0.0:
             gate_proj = self._gaussian_topk(gate_proj)
-        activations = self.act_fn(gate_proj)
+        activations = nn.gelu_approx(gate_proj)
         up_proj = self.up_proj(x)
         down_proj = self.down_proj(activations * up_proj)
         return down_proj
 
     def _gaussian_topk(self, inputs: mx.array) -> mx.array:
-        # Calculate the cutoff value based on the target sparsity
-        # For normal distribution, we use the inverse CDF (quantile function)
-        # Convert to numpy, calculate the quantile, then back to mx.array
-        # Use numpy's special functions instead of scipy
-        if self.activation_sparsity <= 0.0:
-            # For 0 sparsity, return infinity to match PyTorch behavior
-            # This will make all values pass through
-            inf_value = mx.array(float("inf"))
-            return mx.broadcast_to(inf_value, inputs.shape)
-
-        normal_dist = mx.random.normal((1,))
-
-        # Generate a large sample from normal distribution
-        sample_size = 100000
-        normal_samples = mx.random.normal(shape=(sample_size,))
-
-        # Sort the samples
-        sorted_samples = mx.sort(normal_samples)
-
-        # Find the index corresponding to our target sparsity
-        idx = int(self.activation_sparsity * sample_size)
-
-        # Get the value at that index as our std_multiplier
-        std_multiplier = float(sorted_samples[idx]) if idx < sample_size else 0.0
-
-        # Calculate mean and standard deviation along the last dimension
+        # For normal distribution, icdf(p) = -sqrt(2) * erfinv(2p - 1)
+        p = mx.array(self.activation_sparsity, dtype=mx.float32)
+        std_multiplier = mx.sqrt(2) * mx.erfinv(2 * p - 1)
+        std_multiplier = std_multiplier.astype(inputs.dtype)
         inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
         inputs_std = mx.std(inputs, axis=-1, keepdims=True)
-
-        # Calculate the cutoff threshold
         cutoff_x = inputs_mean + inputs_std * std_multiplier
-
-        # Apply ReLU to zero out values below the cutoff
         return mx.maximum(0, inputs - cutoff_x)
 
-
 class Gemma3p5AltUp(nn.Module):
-    """Alternating Updates (AltUp)
+    """Alternating Updates (AltUp)"""
 
-    The AltUp module wraps transformer layers. The `predict` step modifies the
-    input to the transformer layer, and the `correct` step propagates the output
-    of the transformer layer to the sparsely updated dimensions.
-
-    See more in the research paper:
-
-    https://proceedings.neurips.cc/paper_files/paper/2023/file/f2059277ac6ce66e7e5543001afa8bb5-Paper-Conference.pdf
-    """
-
-    def __init__(self, config: TextConfig, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config: TextConfig):
+        super().__init__()
         self.config = config
 
-        self.correct_output_scale = mx.zeros(
-            (self.config.hidden_size)
-        )
+        self.correct_output_scale = mx.zeros((self.config.hidden_size,))
         self.correction_coefs = nn.Linear(self.config.altup_num_inputs, self.config.altup_num_inputs, bias=False)
         self.prediction_coefs = nn.Linear(self.config.altup_num_inputs, self.config.altup_num_inputs**2, bias=False)
         self.modality_router = nn.Linear(self.config.hidden_size, self.config.altup_num_inputs, bias=False)
@@ -307,49 +258,73 @@ class Gemma3p5AltUp(nn.Module):
 
     def compute_router_modalities(self, x: mx.array) -> mx.array:
         router_inputs = self.router_norm(x) * self._router_input_scale.astype(self.router_norm.weight.dtype)
-        # routed adapted from jax.numpy.einsum("btf,fd->btd", ...)
         routed = self.modality_router(router_inputs).astype(mx.float32)
         return mx.tanh(routed)
 
     def predict(self, x: mx.array) -> mx.array:
         modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
+
+        # Force float32 computation like PyTorch
         self.prediction_coefs.weight = self.prediction_coefs.weight.astype(mx.float32)
 
         if self.config.altup_coef_clip is not None:
-            self.prediction_coefs.weight = mx.clip(self.prediction_coefs.weight, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+            self.prediction_coefs.weight = mx.clip(
+                self.prediction_coefs.weight,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip
+            )
 
-        # all_coefs adapted from jax.numpy.einsum("...p,pij->...ij", ...)
-        # Project and then transpose all 2D matrices contained so that mulmat gives the correct result
-        all_coefs: mx.array = (
+        # Fix: Use permute pattern that matches PyTorch exactly
+        all_coefs = (
             self.prediction_coefs(modalities)
             .reshape(*modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs)
-            .transpose(0, 1, 3, 2)
+            .transpose(0, 1, 3, 2)  # This should match PyTorch's permute(0, 1, 3, 2)
         )
 
-        # permute hidden_states to [batch_size, num_tokens, hidden_size, altup_num_inputs]
-        predictions = mx.matmul(x.transpose(1, 2, 3, 0), all_coefs)
-        predictions = predictions.transpose(3, 0, 1, 2)  # undo the permute
-        predictions += x  # add the original input
+        # Fix: Match PyTorch's tensor manipulation exactly
+        # PyTorch: hidden_states.float().permute(1, 2, 3, 0)
+        x_permuted = x.astype(mx.float32).transpose(1, 2, 3, 0)
+        predictions = mx.matmul(x_permuted, all_coefs)
+        predictions = predictions.transpose(3, 0, 1, 2)  # Match PyTorch's permute(3, 0, 1, 2)
+        predictions += x
         return predictions.astype(x.dtype)
-
 
     def correct(self, predictions: mx.array, activated: mx.array):
         modalities = self.compute_router_modalities(activated)
 
-        if self.config.altup_coef_clip is not None:
-            self.correction_coefs.weight = mx.clip(self.correction_coefs.weight, -self.config.altup_coef_clip, self.config.altup_coef_clip)
+        # Force float32 computation like PyTorch
+        self.correction_coefs.weight = self.correction_coefs.weight.astype(mx.float32)
 
-        # all_coefs adapted from jax.numpy.einsum("...p,pi->...i", ...)
-        all_coefs: mx.array = self.correction_coefs(modalities)
+        if self.config.altup_coef_clip is not None:
+            self.correction_coefs.weight = mx.clip(
+                self.correction_coefs.weight,
+                -self.config.altup_coef_clip,
+                self.config.altup_coef_clip
+            )
+
+        # Fix: Match PyTorch's broadcasting approach instead of loop
+        all_coefs = self.correction_coefs(modalities) + 1.0
+
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
 
-        corrected = mx.zeros_like(predictions)
-        for i in range(self.config.altup_num_inputs):
-            coef = mx.expand_dims(all_coefs[..., i] + 1, axis=-1)
-            corrected[i] = (predictions[i] + coef * innovation).astype(activated.dtype)
+        # Replicate innovation for all inputs like PyTorch
+        innovation_expanded = mx.broadcast_to(
+            mx.expand_dims(innovation, axis=0),
+            (self.config.altup_num_inputs,) + innovation.shape
+        )
 
-        return corrected
+        # Fix: Match PyTorch's tensor manipulation
+        # PyTorch: all_coefs.permute(2, 1, 0).unsqueeze(1)
+        all_coefs_reshaped = all_coefs.transpose(2, 1, 0)
+        all_coefs_reshaped = mx.expand_dims(all_coefs_reshaped, axis=1)
+
+        # Broadcast multiply like PyTorch
+        corrected = innovation_expanded * all_coefs_reshaped
+        corrected += predictions
+
+        return corrected.astype(activated.dtype)
+
 
     def scale_corrected_output(self, corrected: mx.array):
         scale = self.correct_output_scale if self.config.altup_correct_scale else 1.0
@@ -364,25 +339,18 @@ class Gemma3p5AltUp(nn.Module):
         return corrected, output
 
 
-
 class Gemma3p5DecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: TextConfig,
-        layer_idx: int
-    ):
+    def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self.self_attn = Gemma3p5Attention(config, layer_idx)
-        self.mlp = MLP(config, layer_idx)
+        self.mlp = MLP(config, layer_idx=layer_idx)
         self.input_layernorm = Gemma3p5RMSNorm(
-            dim=self.hidden_size,
-            eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=True,
+            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
+
         self.post_attention_layernorm = Gemma3p5RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
@@ -392,9 +360,8 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.post_feedforward_layernorm = Gemma3p5RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
-
-        self.sliding_window = config.sliding_window
         self.is_sliding = self.self_attn.is_sliding
+        self.sliding_window = config.sliding_window
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
@@ -403,9 +370,9 @@ class Gemma3p5DecoderLayer(nn.Module):
         self.laurel = Gemma3p5LaurelBlock(config)
         self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
         self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
-        self.post_per_layer_input_norm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True)
-        self.post_laurel_norm = Gemma3p5RMSNorm(self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=False)
-
+        self.post_per_layer_input_norm = Gemma3p5RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
+        )
 
     def __call__(
         self,
@@ -414,12 +381,14 @@ class Gemma3p5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         caches: Optional[List[Any]] = None,
+        cache_position: Optional[mx.array] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
+
 
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
@@ -430,41 +399,44 @@ class Gemma3p5DecoderLayer(nn.Module):
             mask,
             cache,
             caches,
+            cache_position,
         )
+
         attn = self.post_attention_layernorm(attn)
 
-        attn_gated = active_prediction + attn
 
+        attn_gated = active_prediction + attn
         attn_laurel = (attn_gated + laurel_output) / mx.sqrt(mx.array(2.0, dtype=active_prediction.dtype))
 
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
         attn_ffw = self.mlp(attn_norm)
         attn_ffw_norm = self.post_feedforward_layernorm(attn_ffw)
         attn_ffw_laurel_gated = attn_laurel + attn_ffw_norm
+
         corrected_predictions = self.altup.correct(predictions, attn_ffw_laurel_gated)
 
         first_prediction = corrected_predictions[self.config.altup_active_idx]
         if self.config.altup_correct_scale:
             first_prediction = self.altup.scale_corrected_output(first_prediction)
 
-        # per_layer_input_gate adapted from jax.numpy.einsum("btd,dp->btp", ...)
+
         first_prediction = self.per_layer_input_gate(first_prediction)
         first_prediction = nn.gelu_approx(first_prediction)
+
         first_prediction = mx.multiply(first_prediction, per_layer_input)
 
-        # per_layer_projection adapted from jax.numpy.einsum("btp,pd->btd", ...)
         first_prediction = self.per_layer_projection(first_prediction)
         first_prediction = self.post_per_layer_input_norm(first_prediction)
+
 
         for i in range(1, len(corrected_predictions)):
             corrected_predictions[i] = corrected_predictions[i] + first_prediction
 
         return corrected_predictions
 
+
 class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
-    """
-    This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
-    """
+    """This module overrides nn.Embeddings' forward by multiplying with embeddings scale."""
 
     def __init__(self, num_embeddings: int, embedding_dim: int, embed_scale: Optional[float] = 1.0):
         super().__init__(num_embeddings, embedding_dim)
@@ -472,6 +444,7 @@ class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
 
     def __call__(self, x: mx.array):
         return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(self.weight.dtype)
+
 
 class Gemma3Model(nn.Module):
     def __init__(self, config: TextConfig):
@@ -482,7 +455,9 @@ class Gemma3Model(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
 
-        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5)
+        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(
+            config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
+        )
         self.layers = [
             Gemma3p5DecoderLayer(config=config, layer_idx=layer_idx)
             for layer_idx in range(config.num_hidden_layers)
@@ -505,10 +480,15 @@ class Gemma3Model(nn.Module):
             with_scale=True,
         )
 
-        self.altup_projections = [nn.Linear(config.hidden_size, config.hidden_size, bias=False) for _ in range(1, self.config.altup_num_inputs)]
+        self.altup_projections = [
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            for _ in range(1, self.config.altup_num_inputs)
+        ]
 
-
-        self.altup_unembed_projections = [nn.Linear(config.hidden_size, config.hidden_size, bias=False) for _ in range(1, self.config.altup_num_inputs)]
+        self.altup_unembed_projections = [
+            nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+            for _ in range(1, self.config.altup_num_inputs)
+        ]
 
         self.norm = Gemma3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True)
 
@@ -517,7 +497,7 @@ class Gemma3Model(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array=None,
+        inputs: mx.array = None,
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
@@ -526,7 +506,6 @@ class Gemma3Model(nn.Module):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
-
         else:
             h = inputs_embeds
 
@@ -543,25 +522,32 @@ class Gemma3Model(nn.Module):
             full_mask = create_attention_mask(h, cache[j - 1 : j])
             sliding_window_mask = create_attention_mask(h, cache)
 
-
         h0 = h
+
+        cache_position = None
+        if cache_position is None:
+            past_seen_tokens = cache[0].offset if cache is not None else 0
+            cache_position = mx.arange(
+                past_seen_tokens,
+                past_seen_tokens + h.shape[1]
+            )
+
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
         epsilon_tensor = mx.finfo(mx.float16).min
 
-        h: list[mx.array] = [h0] * self.config.altup_num_inputs
+        h_list = [h0] * self.config.altup_num_inputs
 
         for i in range(1, self.config.altup_num_inputs):
-            # altup_proj adapted from jax.numpy.einsum("btp,pd->btd", ...)
-            altup_proj: mx.array = self.altup_projections[i - 1](h[i])
-            h[i] = altup_proj.astype(h0.dtype)
-            new_magnitude = mx.mean(h[i] ** 2, axis=-1, keepdims=True) ** 0.5
-            h[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
+            altup_proj = self.altup_projections[i - 1](h_list[i])
+            h_list[i] = altup_proj.astype(h0.dtype)
+            new_magnitude = mx.mean(h_list[i] ** 2, axis=-1, keepdims=True) ** 0.5
+            h_list[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
 
-        h = mx.stack(h, axis=0)
+        h = mx.stack(h_list, axis=0)
 
-        for i, (layer, c) in enumerate(zip(self.layers[ : self.config.num_hidden_layers], cache)):
+        for i, (layer, c) in enumerate(zip(self.layers[:self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             is_global = (
@@ -575,23 +561,20 @@ class Gemma3Model(nn.Module):
             elif mask is None:
                 local_mask = sliding_window_mask
 
-            h = layer(h, local_mask, c, per_layer_input, cache)
+            h = layer(h, local_mask, c, per_layer_input, cache, cache_position)
 
-
-         # Per-layer inputs to single output
+        # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
 
         for i in range(1, self.config.altup_num_inputs):
-            # altup_unembed_projections adapted from jax.numpy.einsum("btp,pd->btd", ...)
             altup_unemb_proj = self.altup_unembed_projections[i - 1](h[i])
             h[i] = altup_unemb_proj.astype(h0.dtype)
             new_magnitude = mx.mean(h[i] ** 2, axis=-1, keepdims=True) ** 0.5
             h[i] *= target_magnitude / mx.maximum(new_magnitude, epsilon_tensor)
 
-        h = mx.mean(mx.stack(h), axis=0)
+        h = mx.mean(h, axis=0)
 
         return self.norm(h)
-
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
         per_layer_inputs_mask = mx.logical_and(input_ids >= 0, input_ids < self.vocab_size)
@@ -616,11 +599,9 @@ class Gemma3Model(nn.Module):
             return per_layer_projection
 
         if per_layer_projection.shape != per_layer_inputs.shape:
-            # per-layer inputs are sometimes padded with zeros, slice the relevant embeddings.
             per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
 
         return (per_layer_projection + per_layer_inputs) * self._per_layer_input_scale.astype(inputs_embeds.dtype)
-
 
 
 class LanguageModel(nn.Module):
@@ -631,14 +612,16 @@ class LanguageModel(nn.Module):
         self.model = Gemma3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.final_logit_softcapping = config.final_logit_softcapping
+
     def __call__(
         self,
-        inputs: mx.array=None,
+        inputs: mx.array = None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs
     ):
-        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
+        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs)
         out = self.lm_head(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
@@ -670,38 +653,39 @@ class LanguageModel(nn.Module):
 
         for i in range(self.config.num_hidden_layers):
 
-            if (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            ):
-                caches.append(
-                    StaticKVCache(
-                        max_size=self.config.sliding_window,
-                    )
-                )
-            else:
-                caches.append(
-                    SlidingWindowCache(
-                        max_size=self.config.sliding_window,
-                    )
-                )
-
             # if (
             #     i % self.config.sliding_window_pattern
             #     == self.config.sliding_window_pattern - 1
             # ):
             #     caches.append(
-            #         KVCache()
+            #         StaticKVCache(
+            #             max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
+            #         )
             #     )
             # else:
             #     caches.append(
-            #         RotatingKVCache(
-            #             max_size=self.config.sliding_window,
-            #             keep=0
+            #         SlidingWindowCache(
+            #             max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
             #         )
             #     )
 
+            if (
+                i % self.config.sliding_window_pattern
+                == self.config.sliding_window_pattern - 1
+            ):
+                caches.append(
+                    KVCache()
+                )
+            else:
+                caches.append(
+                    RotatingKVCache(
+                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
+                    )
+                )
+
         return caches
+
+
 
 class SlidingWindowCache(_BaseCache):
     """A sliding window cache for local attention layers."""
