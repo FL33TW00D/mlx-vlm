@@ -188,7 +188,29 @@ class Gemma3p5Attention(nn.Module):
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-        output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
+        # output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
+
+        keys = mx.repeat(keys, repeats=self.repeats, axis=1)
+        values = mx.repeat(values, repeats=self.repeats, axis=1)
+
+
+
+        attn_weights = mx.matmul(queries, keys.swapaxes(2,3)) * self.scale
+
+        if self.attn_logit_softcapping is not None:
+            print("softcap", self.attn_logit_softcapping)
+            attn_weights = attn_weights / self.attn_logit_softcapping
+            attn_weights = mx.tanh(attn_weights)
+            attn_weights = attn_weights * self.attn_logit_softcapping
+        if mask is not None:  # no matter the length, we just slice it
+            causal_mask = mask[:, :, :, : keys.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        # upcast attention to fp32
+        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(queries.dtype)
+
+        output = mx.matmul(attn_weights, values)
+
         output = output.transpose(0, 2, 1, 3).reshape(input_shape + (-1,))
 
         return self.o_proj(output)
@@ -372,9 +394,34 @@ class Gemma3p5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         caches: Optional[List[Any]] = None,
+        cache_position: Optional[mx.array] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
+
+
+        if self.is_sliding and mask is not None:  # efficient SDPA and no padding
+            # In prefill, we may be larger than sliding window
+            effective_seq_len = max(cache_position.shape[0], self.sliding_window)
+            # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
+            # thus we must slice from the right (at most `effective_seq_len` elements)
+
+            min_dtype = mx.finfo(mask.dtype).min
+            sliding_window_mask = mx.tril(
+                mx.ones(mask.shape, dtype=mx.bool_), k=-self.sliding_window
+            )
+            mask = mx.where(sliding_window_mask, min_dtype, mask)
+            # In case we are beyond the sliding window, we need to correctly offset the mask slicing
+            offset = cache_position[-1] - effective_seq_len + 1
+            # Should only be used when beyond the sliding window (i.e. offset > 0)
+            offset = mx.clip(offset, a_min=0, a_max=None)
+            # equivalent to: `attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]`,
+            # but without data-dependent slicing (i.e. torch.compile friendly)
+            mask_indexes = mx.arange(
+                min(effective_seq_len, mask.shape[-1])
+            )
+            mask_indexes += offset
+            mask = mask[:, :, :, mask_indexes]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -495,8 +542,8 @@ class Gemma3Model(nn.Module):
 
         dtype = input_tensor.dtype
         sequence_length = input_tensor.shape[1]
-        if isinstance(past_key_values[0], (SlidingWindowCache, StaticKVCache)):
-            target_length = past_key_values[0].get_max_cache_shape()
+        if isinstance(past_key_values[0], (RotatingKVCache, KVCache)):
+            target_length = self.config.sliding_window
         else:
             target_length = attention_mask.shape[-1] if attention_mask is not None else input_tensor.shape[1]
 
@@ -592,15 +639,10 @@ class Gemma3Model(nn.Module):
 
             past_seen_tokens = cache[0].offset if cache is not None else 0
 
-            # print("past_seen_tokens", past_seen_tokens)
-            # print("h.shape[1]", h.shape[1])
-
             cache_position = mx.arange(
                 past_seen_tokens,
                 past_seen_tokens + h.shape[1],
             )
-
-        # print("cache_position", cache_position)
 
         causal_mask = self._update_causal_mask(
             mask,
@@ -610,7 +652,6 @@ class Gemma3Model(nn.Module):
 
         )
 
-        # print("causal_mask", causal_mask.shape)
 
         h0 = h
 
@@ -631,9 +672,7 @@ class Gemma3Model(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers[:self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-
-
-            h = layer(h, causal_mask, c, per_layer_input, cache)
+            h = layer(h, causal_mask, c, per_layer_input, cache, cache_position)
 
         # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
