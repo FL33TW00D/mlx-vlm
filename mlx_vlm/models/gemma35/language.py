@@ -9,7 +9,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
-from ..cache import KVCache, RotatingKVCache
+from ..cache import KVCache, RotatingKVCache, ChunkedKVCache
 
 
 @dataclass
@@ -18,10 +18,10 @@ class TextConfig:
     hidden_size: int
     num_hidden_layers: int
     intermediate_size: int
-    num_attention_heads: int = 8
+    num_attention_heads: int = 2
     head_dim: int = 256
     rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262208
+    vocab_size: int = 262144
     num_key_value_heads: int = 4
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5
@@ -31,7 +31,7 @@ class TextConfig:
     altup_correct_scale: bool = True
     hidden_size_per_layer_input: int = 1024
     rope_local_base_freq: float = 10000.0
-    rope_traditional: bool = True
+    rope_traditional: bool = False
     rope_theta: float = 1000000.0
     query_pre_attn_scalar: float = 0.0625
     sliding_window: int = 1024
@@ -39,10 +39,11 @@ class TextConfig:
     mm_tokens_per_image: int = 256
     sliding_window_pattern: int = 5
     activation_sparsity_pattern: Optional[List[float]] = None
-    final_logit_softcapping: float = 1.0
+    final_logit_softcapping: float = 30.0
     query_rescale_scalar: float = 1.0
     num_kv_shared_layers: int = 0
     max_position_embeddings: int = 32768
+    attn_logit_softcapping: float = 0.0
 
     @classmethod
     def from_dict(cls, params):
@@ -84,12 +85,6 @@ class Gemma3p5RMSNorm(nn.Module):
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
-
-
-
-
-
-
 class Gemma3p5LaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
 
@@ -116,7 +111,8 @@ class Gemma3p5LaurelBlock(nn.Module):
 class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
+        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern
+        self.attn_logit_softcapping = config.attn_logit_softcapping
 
         dim = config.hidden_size
         self.n_heads = n_heads = config.num_attention_heads
@@ -155,7 +151,7 @@ class Gemma3p5Attention(nn.Module):
         self.rope = nn.RoPE(
             head_dim,
             traditional=config.rope_traditional,
-            base=config.rope_local_base_freq if self.is_sliding else config.rope_theta,
+            base=config.rope_theta if self.is_sliding else config.rope_local_base_freq,
         )
 
     def __call__(
@@ -164,7 +160,6 @@ class Gemma3p5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
-        cache_position: Optional[mx.array] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -179,6 +174,7 @@ class Gemma3p5Attention(nn.Module):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
             keys, values = shared_cache.state
+
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
             keys = self.qkv_norm(keys)
@@ -192,16 +188,11 @@ class Gemma3p5Attention(nn.Module):
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-
-        # Sliding window mask
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[..., -keys.shape[-2] :]
-
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
+        output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         output = output.transpose(0, 2, 1, 3).reshape(input_shape + (-1,))
+
         return self.o_proj(output)
+
 
 
 class MLP(nn.Module):
@@ -381,7 +372,6 @@ class Gemma3p5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         caches: Optional[List[Any]] = None,
-        cache_position: Optional[mx.array] = None,
     ):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
@@ -399,7 +389,6 @@ class Gemma3p5DecoderLayer(nn.Module):
             mask,
             cache,
             caches,
-            cache_position,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -493,7 +482,90 @@ class Gemma3Model(nn.Module):
         self.norm = Gemma3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True)
 
         self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
-        self._per_layer_input_scale = mx.sqrt(mx.array(2.0))
+        self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
+
+    def _update_causal_mask(
+        self,
+        attention_mask: mx.array,
+        input_tensor: mx.array,
+        cache_position: mx.array,
+        past_key_values: mx.array
+    ):
+
+
+        dtype = input_tensor.dtype
+        sequence_length = input_tensor.shape[1]
+        if isinstance(past_key_values[0], (SlidingWindowCache, StaticKVCache)):
+            target_length = past_key_values[0].get_max_cache_shape()
+        else:
+            target_length = attention_mask.shape[-1] if attention_mask is not None else input_tensor.shape[1]
+
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+        )
+        return causal_mask
+
+    @staticmethod
+    def _prepare_4d_causal_attention_mask_with_cache_position(
+        attention_mask: mx.array,
+        sequence_length: int,
+        target_length: int,
+        dtype: mx.float32,
+        cache_position: mx.array,
+        batch_size: int,
+        **kwargs,
+    ):
+        """
+        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
+        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
+
+        Args:
+            attention_mask (`torch.Tensor`):
+                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
+                `(batch_size, 1, query_length, key_value_length)`.
+            sequence_length (`int`):
+                The sequence length being processed.
+            target_length (`int`):
+                The target length: when generating with static cache, the mask should be as long as the static cache,
+                to account for the 0 padding, the part of the cache that is not filled yet.
+            dtype (`torch.dtype`):
+                The dtype to use for the 4D attention mask.
+            cache_position (`torch.Tensor`):
+                Indices depicting the position of the input sequence tokens in the sequence.
+            batch_size (`torch.Tensor`):
+                Batch size.
+        """
+
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
+            causal_mask = attention_mask
+        else:
+            min_dtype = mx.finfo(dtype).min
+            causal_mask = mx.ones((sequence_length, target_length), dtype=dtype)
+            if sequence_length != 1:
+                causal_mask = mx.triu(causal_mask, k=1)
+            causal_mask *= mx.arange(target_length) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :]
+
+            if attention_mask is not None:
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = mx.where(
+                    padding_mask,
+                    -mx.inf,
+                    causal_mask[:, :, :, :mask_length]
+                )
+
+
+        return causal_mask
+
 
     def __call__(
         self,
@@ -504,10 +576,7 @@ class Gemma3Model(nn.Module):
         **kwargs
     ):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
-        if inputs_embeds is None:
-            h = self.embed_tokens(inputs)
-        else:
-            h = inputs_embeds
+        h = self.embed_tokens(inputs)
 
         if per_layer_inputs is None and inputs is not None:
             per_layer_inputs = self.get_per_layer_inputs(inputs)
@@ -517,25 +586,37 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        if mask is None:
-            j = self.config.sliding_window_pattern
-            full_mask = create_attention_mask(h, cache[j - 1 : j])
-            sliding_window_mask = create_attention_mask(h, cache)
-
-        h0 = h
 
         cache_position = None
         if cache_position is None:
+
             past_seen_tokens = cache[0].offset if cache is not None else 0
+
+            # print("past_seen_tokens", past_seen_tokens)
+            # print("h.shape[1]", h.shape[1])
+
             cache_position = mx.arange(
                 past_seen_tokens,
-                past_seen_tokens + h.shape[1]
+                past_seen_tokens + h.shape[1],
             )
 
+        # print("cache_position", cache_position)
+
+        causal_mask = self._update_causal_mask(
+            mask,
+            h,
+            cache_position,
+            cache,
+
+        )
+
+        # print("causal_mask", causal_mask.shape)
+
+        h0 = h
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
-        epsilon_tensor = mx.finfo(mx.float16).min
+        epsilon_tensor = mx.array(1e-10, dtype=h0.dtype)
 
         h_list = [h0] * self.config.altup_num_inputs
 
@@ -550,18 +631,9 @@ class Gemma3Model(nn.Module):
         for i, (layer, c) in enumerate(zip(self.layers[:self.config.num_hidden_layers], cache)):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
-            is_global = (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            )
 
-            local_mask = mask
-            if mask is None and is_global:
-                local_mask = full_mask
-            elif mask is None:
-                local_mask = sliding_window_mask
 
-            h = layer(h, local_mask, c, per_layer_input, cache, cache_position)
+            h = layer(h, causal_mask, c, per_layer_input, cache)
 
         # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
@@ -653,22 +725,6 @@ class LanguageModel(nn.Module):
 
         for i in range(self.config.num_hidden_layers):
 
-            # if (
-            #     i % self.config.sliding_window_pattern
-            #     == self.config.sliding_window_pattern - 1
-            # ):
-            #     caches.append(
-            #         StaticKVCache(
-            #             max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
-            #         )
-            #     )
-            # else:
-            #     caches.append(
-            #         SlidingWindowCache(
-            #             max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
-            #         )
-            #     )
-
             if (
                 i % self.config.sliding_window_pattern
                 == self.config.sliding_window_pattern - 1
@@ -679,7 +735,8 @@ class LanguageModel(nn.Module):
             else:
                 caches.append(
                     RotatingKVCache(
-                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings)
+                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings),
+                        keep=self.config.sliding_window_pattern
                     )
                 )
 
@@ -746,6 +803,11 @@ class SlidingWindowCache(_BaseCache):
             self.keys, self.values = v
             if self.keys is not None:
                 self.offset = self.max_size
+
+
+
+    def get_max_cache_shape(self):
+        return self.max_size
 
     @property
     def meta_state(self):
