@@ -178,15 +178,16 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
-        input_embeddings, final_attention_mask_4d = self.get_input_embeddings(
-            input_ids, pixel_values, mask
+        input_features = kwargs.get("input_features", None)
+
+        input_embeddings = self.get_input_embeddings(
+            input_ids, pixel_values, input_features
         )
 
         logits = self.language_model(
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings,
-            # mask=final_attention_mask_4d, # TODO: Fix mask
         )
         return logits
 
