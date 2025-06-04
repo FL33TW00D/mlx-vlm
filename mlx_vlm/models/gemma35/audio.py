@@ -1,10 +1,13 @@
 import math
+import inspect
 from dataclasses import dataclass
 from typing import Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
+from .language import Gemma3p5RMSNorm
 
 
 @dataclass
@@ -26,48 +29,72 @@ class AudioConfig:
     sscp_conv_group_norm_eps: float = 1e-3
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
+    vocab_size: int = 262144
+
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
-class Gemma3p5RMSNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        *args,
-        eps: float = 1e-6,
-        scale_shift: float = 1.0,
-        with_scale: bool = True,
-        **kwargs,
-    ):
-        super().__init__()
-        self.eps = eps
-        self.scale_shift = scale_shift
-        self.with_scale = with_scale
 
-        if self.with_scale:
-            self.weight = mx.ones(dim)
+class Gemma3NanoAudioEmbedder(nn.Module):
+    """Embeds token ids or soft tokens into language model space."""
+
+    def __init__(self, config: AudioConfig, *args, vocab_offset: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if (audio_config := config.audio_config) is None:
+            raise ValueError("`Gemma3p5Config` passed as `config` cannot have `audio_config=None`")
+
+        self.audio_config: AudioConfig = audio_config
+        self.text_config = config.text_config
+        self.vocab_offset = vocab_offset
+
+        self.embedding = nn.Embedding(self.audio_config.vocab_size, self.audio_config.hidden_size)
+
+        self.hard_embedding_norm = Gemma3p5RMSNorm(
+            dim=self.audio_config.hidden_size,
+            eps=self.audio_config.embedding_norm_eps,
+            scale_shift=0.0,
+            with_scale=True,
+        )
+
+        self.soft_embedding_norm = Gemma3p5RMSNorm(
+            dim=self.audio_config.hidden_size,
+            eps=self.audio_config.embedding_norm_eps,
+            scale_shift=0.0,
+            with_scale=True,
+        )
+
+        self.embedding_projection = nn.Linear(self.audio_config.hidden_size, self.text_config.hidden_size, bias=False)
+
+        self.embedding_post_projection_norm = Gemma3p5RMSNorm(
+            dim=self.text_config.hidden_size,
+            eps=self.audio_config.embedding_norm_eps,
+            scale_shift=0.0,
+            with_scale=False,
+        )
+
+    def __call__(
+        self, input_ids_or_embs: mx.array, is_soft_embedding: bool = False
+    ) -> mx.array:
+
+        if is_soft_embedding:
+            emb_norm = self.soft_embedding_norm(input_ids_or_embs)
         else:
-            self.weight = mx.array(1.0)
+            input_ids = input_ids_or_embs - self.vocab_offset
+            input_ids = mx.where(input_ids < 0, self.audio_config.vocab_size - 1, input_ids)
+            hard_emb = self.embedding(input_ids)
+            emb_norm = self.hard_embedding_norm(hard_emb)
 
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
-    def __call__(self, x: mx.array):
-        x, original_dtype = self._guard_against_excess_precision(x)
-
-        scale = self.weight
-        if self.scale_shift != 0.0:
-            scale += self.scale_shift
-
-        mean_squared = x.pow(2).mean(-1, keepdim=True)
-        root_mean_squared = x * mx.rsqrt(mean_squared + self.eps)
-        # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
-        scaled = root_mean_squared * scale.float()
-        return scaled.type(original_dtype)
-
-    def _guard_against_excess_precision(self, x: mx.array) -> tuple[mx.array, mx.Dtype]:
-        # TODO(ryanmullins): Implement Torch equivalent to jax.lax.reduce_precision
-        return x.float(), x.dtype
+        emb_norm_proj = self.embedding_projection(emb_norm)
+        return self.embedding_post_projection_norm(emb_norm_proj)
 
 
 class Gemma3p5AudioRelativePositionEmbedding(nn.Module):

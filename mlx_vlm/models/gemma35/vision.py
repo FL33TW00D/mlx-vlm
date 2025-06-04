@@ -6,6 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .language import Gemma3p5RMSNorm
+
 
 @dataclass
 class VisionConfig:
@@ -44,6 +46,59 @@ def check_array_shape(arr):
         return True
     else:
         return False
+
+
+
+
+class Gemma3p5VisionEmbedder(nn.Module):
+    def __init__(self, config: VisionConfig, *args, vocab_offset: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if (vision_config := config.vision_config) is None:
+            raise ValueError("`Gemma3p5Config` passed as `config` cannot have `vision_config=None`")
+
+        self.vision_config: VisionConfig = vision_config
+        self.text_config = config.text_config
+        self.vocab_offset = vocab_offset
+
+        self.embedding = nn.Embedding(self.vision_config.vocab_size, self.vision_config.hidden_size)
+
+        self.hard_embedding_norm = Gemma3p5RMSNorm(
+            self.vision_config.hidden_size,
+            eps=self.text_config.rms_norm_eps,
+            scale_shift=0.0,
+            with_scale=True,
+        )
+
+        self.soft_embedding_norm = Gemma3p5RMSNorm(
+            self.vision_config.hidden_size,
+            eps=self.text_config.rms_norm_eps,
+            scale_shift=0.0,
+            with_scale=True,
+        )
+
+        self.embedding_projection = nn.Linear(self.vision_config.hidden_size, self.text_config.hidden_size, bias=False)
+
+        self.embedding_post_projection_norm = Gemma3p5RMSNorm(
+            dim=self.text_config.hidden_size,
+            eps=self.text_config.rms_norm_eps,
+            scale_shift=0.0,
+            with_scale=False,
+        )
+
+    def __call__(
+        self, input_ids_or_embs: mx.array, is_soft_embedding: bool = False
+    ) -> mx.array:
+
+        if is_soft_embedding:
+            emb_norm = self.soft_embedding_norm(input_ids_or_embs)
+        else:
+            input_ids = input_ids_or_embs - self.vocab_offset
+            input_ids = mx.where(input_ids < 0, self.vision_config.vocab_size - 1, input_ids)
+            hard_emb = self.embedding(input_ids)
+            emb_norm = self.hard_embedding_norm(hard_emb)
+        emb_norm_proj = self.embedding_projection(emb_norm)
+        return self.embedding_post_projection_norm(emb_norm_proj)
 
 
 class Attention(nn.Module):

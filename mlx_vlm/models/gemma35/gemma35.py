@@ -9,9 +9,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from .audio import AudioConfig, AudioModel
+from .audio import AudioConfig, AudioModel, Gemma3NanoAudioEmbedder
 from .language import LanguageModel, Gemma3p5RMSNorm, TextConfig
-from .vision import VisionConfig, VisionModel
+from .vision import VisionConfig, VisionModel, Gemma3p5VisionEmbedder
 
 
 
@@ -86,87 +86,89 @@ class Model(nn.Module):
         self.model_type = config.model_type
         self.config = config
 
-        # self.vision_tower = VisionModel(config.vision_config)
-
+        # Text
         self.language_model = LanguageModel(config.text_config)
-        # self.multi_modal_projector = Gemma3MultiModalProjector(config)
+
+        # Vision
+        self.vision_tower = VisionModel(config.vision_config)
+        self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
+
+        # Audio
+        self.audio_tower = AudioModel(config.audio_config)
+        self.embed_audio = Gemma3NanoAudioEmbedder(config.audio_config)
+
+
+
+    def embed(self, input_ids):
+        text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
+        inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
+
+        vision_embeds = self.embed_vision(input_ids)
+        inputs_embeds = mx.where(
+            input_ids[..., None] < self.embed_vision.vocab_offset, inputs_embeds, vision_embeds
+            )
+
+        audio_embeds = self.embed_audio(input_ids)
+        inputs_embeds = mx.where(
+            input_ids[..., None] < self.embed_audio.vocab_offset, inputs_embeds, audio_embeds
+        )
+        return inputs_embeds
 
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
-        mask: Optional[mx.array] = None,
+        input_features: Optional[mx.array] = None,
     ):
-        if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids), None
+        if pixel_values is None and input_features is None:
+            return self.embed(input_ids)
 
-        # inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        inputs_embeds = self.embed(input_ids)
 
-        # hidden_state, _, _ = self.vision_tower(
-        #     pixel_values.transpose(0, 2, 3, 1).astype(inputs_embeds.dtype),
-        #     output_hidden_states=True,
-        # )
+        if pixel_values is not None:
+            image_features = self.get_image_features(pixel_values)
+            return self.merge_multimodal_and_text(input_ids, inputs_embeds, image_features, self.config.image_token_id)
 
-        # image_features = hidden_state[None, :].astype(pixel_values.dtype)
-        # image_features = self.multi_modal_projector(image_features)
+        if input_features is not None:
+            audio_outputs = self.get_audio_features(input_features)
+            return self.merge_multimodal_and_text(input_ids, inputs_embeds, audio_outputs, self.config.audio_token_id)
 
-        # final_inputs_embeds, final_attention_mask_4d = (
-        #     self._prepare_inputs_for_multimodal(
-        #         image_features, inputs_embeds, input_ids, mask
-        #     )
-        # )
-        # return final_inputs_embeds, final_attention_mask_4d
+    def get_audio_features(self, input_features):
+        audio_outputs, _, _ = self.audio_tower(input_features)
+        return self.embed_audio(audio_outputs, is_soft_embedding=True)
 
-    def _prepare_inputs_for_multimodal(
-        self, image_features, inputs_embeds, input_ids, attention_mask
-    ):
-        _, _, embed_dim = image_features.shape
-
-        batch_size, sequence_length = input_ids.shape
-        scaled_image_features = image_features / (self.config.hidden_size**0.5)
-        final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
-
-        pad_token_id = self.config.pad_token_id
-        pad_token_id = pad_token_id if pad_token_id is not None else 0
-        text_mask = (input_ids != self.config.image_token_index) & (
-            input_ids != pad_token_id
+    def get_image_features(self, pixel_values):
+        vision_outputs, _, _ = self.vision_tower(
+            pixel_values.transpose(0, 2, 3, 1),
+            output_hidden_states=True,
         )
-        image_mask = input_ids == self.config.image_token_index
-        pad_mask = input_ids == pad_token_id
+        vision_outputs = vision_outputs.reshape(
+            vision_outputs.shape[0], self.config.vision_config.hidden_size, self.config.vision_soft_tokens_per_image
+        ).transpose(0, 2, 1)
 
-        # expand masks to match embedding dimension
-        text_mask_expanded = mx.expand_dims(text_mask, -1)
-        text_mask_expanded = mx.repeat(text_mask_expanded, embed_dim, axis=-1)
-        pad_mask_expanded = mx.expand_dims(pad_mask, -1)
-        pad_mask_expanded = mx.repeat(pad_mask_expanded, embed_dim, axis=-1)
+        # Normalize and embed the soft tokens into language model space.
+        vision_outputs *= self.config.vision_config.hidden_size**0.5
+        return self.embed_vision(vision_outputs, is_soft_embedding=True)
 
-        # insert padding and text token embeddings
-        final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
-        )
-        pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
-        scaled_image_features = mx.pad(
-            scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
-        )
-        # insert image embeddings - the image mask is always less or equal to the sentence in length
-        image_mask_expanded = mx.expand_dims(image_mask, -1)
-        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
-        final_embedding = mx.where(
-            image_mask_expanded, scaled_image_features, final_embedding
-        )
+    def merge_multimodal_and_text(self, input_ids, inputs_embeds, features, token_id):
+        if input_ids is None:
+            special_image_mask = inputs_embeds == self.language_model.model.embed_tokens(
+                mx.tensor(token_id, dtype=mx.long)
+            )
+        else:
+            special_image_mask = mx.expand_dims(input_ids == token_id, -1)
+            special_image_mask = mx.broadcast_to(special_image_mask, inputs_embeds.shape)
 
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
-        )
-
-        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
-        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
-        final_attention_mask_4d = attention_mask_expanded_1 * attention_mask_expanded_2
-        final_attention_mask_4d = final_attention_mask_4d
-        final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
-        final_embedding = mx.array(final_embedding)
-        return final_embedding, final_attention_mask_4d
+        if inputs_embeds[special_image_mask].size != features.size:
+            image_tokens_in_text = (special_image_mask).sum(dim=1).sum(dim=0)[0]
+            raise ValueError(
+                f"Number of images does not match number of special image tokens in the input text. "
+                f"Got {image_tokens_in_text} image tokens in the text and "
+                f"{features.shape[0] * features.shape[1]} tokens from image embeddings."
+            )
+        features = features.astype(inputs_embeds.dtype)
+        inputs_embeds = mx.where(special_image_mask, features.flatten(), inputs_embeds)
+        return inputs_embeds
 
     def __call__(
         self,
