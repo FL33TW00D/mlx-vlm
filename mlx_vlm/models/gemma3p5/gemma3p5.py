@@ -88,12 +88,12 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
 
         # Vision
-        self.vision_tower = VisionModel(config.vision_config)
-        self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
+        # self.vision_tower = VisionModel(config.vision_config)
+        # self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
 
-        # Audio
-        self.audio_tower = AudioModel(config.audio_config)
-        self.embed_audio = Gemma3NanoAudioEmbedder(config.audio_config)
+        # # Audio
+        # self.audio_tower = AudioModel(config.audio_config)
+        # self.embed_audio = Gemma3NanoAudioEmbedder(config.audio_config)
 
     def embed(self, input_ids):
         text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
@@ -192,9 +192,10 @@ class Model(nn.Module):
         # Audio features
         input_features = kwargs.get("input_features", None)
 
-        input_embeddings = self.get_input_embeddings(
-            input_ids, pixel_values, input_features
-        )
+        # input_embeddings = self.get_input_embeddings(
+        #     input_ids, pixel_values, input_features
+        # )
+        input_embeddings = self.language_model.model.embed_tokens(input_ids)
 
         logits = self.language_model(
             inputs=input_ids,
@@ -205,12 +206,14 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized_weights = {}
+
         for k, v in weights.items():
             if "language_model" not in k:
                 k = "language_model." + k
 
             sanitized_weights[k] = v
 
+        sanitized_weights = {k: v for k, v in sanitized_weights.items() if "language_model" in k}
         return sanitized_weights
 
     @staticmethod
