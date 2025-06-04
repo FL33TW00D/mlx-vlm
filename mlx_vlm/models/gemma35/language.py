@@ -1,15 +1,14 @@
 import inspect
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union, Tuple
-
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
-from ..cache import KVCache, RotatingKVCache, ChunkedKVCache
+from ..cache import ChunkedKVCache, KVCache, RotatingKVCache
 
 
 @dataclass
@@ -57,7 +56,13 @@ class TextConfig:
 
 
 class Gemma3p5RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, scale_shift: float = 1.0, with_scale: bool = True):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        scale_shift: float = 1.0,
+        with_scale: bool = True,
+    ):
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
@@ -81,9 +86,9 @@ class Gemma3p5RMSNorm(nn.Module):
 
         return output
 
-
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
+
 
 class Gemma3p5LaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
@@ -92,8 +97,12 @@ class Gemma3p5LaurelBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        self.linear_left = nn.Linear(self.config.hidden_size, self.config.laurel_rank, bias=False)
-        self.linear_right = nn.Linear(self.config.laurel_rank, self.config.hidden_size, bias=False)
+        self.linear_left = nn.Linear(
+            self.config.hidden_size, self.config.laurel_rank, bias=False
+        )
+        self.linear_right = nn.Linear(
+            self.config.laurel_rank, self.config.hidden_size, bias=False
+        )
         self.post_laurel_norm = Gemma3p5RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -107,10 +116,12 @@ class Gemma3p5LaurelBlock(nn.Module):
         normed_laurel_x = self.post_laurel_norm(laurel_x)
         return x + normed_laurel_x
 
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate((-x2, x1), axis=-1)
+
 
 def apply_rotary_pos_emb(
     x: mx.array,
@@ -124,12 +135,15 @@ def apply_rotary_pos_emb(
     sin = mx.expand_dims(sin, unsqueeze_dim)
     return (x * cos) + (rotate_half(x) * sin)
 
+
 class Gemma3p5RotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig, device=None):
         super().__init__()
 
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+            self.rope_type = config.rope_scaling.get(
+                "rope_type", config.rope_scaling.get("type")
+            )
         else:
             self.rope_type = "default"
         self.max_seq_len_cached = config.max_position_embeddings
@@ -140,23 +154,27 @@ class Gemma3p5RotaryEmbedding(nn.Module):
         # TODO: This is a hack to get the RoPE parameters just for testing.
         # Will be removed...
         from transformers.modeling_rope_utils import _compute_default_rope_parameters
+
         self.rope_init_fn = _compute_default_rope_parameters
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
 
-
     def __call__(self, x, position_ids):
         inv_freq_expanded = self._inv_freq[None, :, None].astype(mx.float32)
         position_ids_expanded = position_ids[:, None, :].astype(mx.float32)
 
-        freqs = (inv_freq_expanded.astype(mx.float32) @ position_ids_expanded.astype(mx.float32)).transpose(0, 2, 1)
+        freqs = (
+            inv_freq_expanded.astype(mx.float32)
+            @ position_ids_expanded.astype(mx.float32)
+        ).transpose(0, 2, 1)
         emb = mx.concatenate((freqs, freqs), axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
+
 
 class Gemma3p5Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
@@ -185,7 +203,9 @@ class Gemma3p5Attention(nn.Module):
             with_scale=False,
         )
 
-        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx
 
         # Compute the layer index from which shared KV cache values will be retrieved.
@@ -217,7 +237,13 @@ class Gemma3p5Attention(nn.Module):
         queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
         queries = queries.transpose(0, 2, 1, 3)
 
-        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None and caches is not None and cache is not None and cache.offset > 0:
+        if (
+            self.is_kv_shared_layer
+            and self.kv_shared_layer_index is not None
+            and caches is not None
+            and cache is not None
+            and cache.offset > 0
+        ):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
             keys, values = shared_cache.state
@@ -240,9 +266,7 @@ class Gemma3p5Attention(nn.Module):
         keys = mx.repeat(keys, repeats=self.repeats, axis=1)
         values = mx.repeat(values, repeats=self.repeats, axis=1)
 
-
-
-        attn_weights = mx.matmul(queries, keys.swapaxes(2,3)) * self.scale
+        attn_weights = mx.matmul(queries, keys.swapaxes(2, 3)) * self.scale
 
         if self.attn_logit_softcapping is not None:
             print("softcap", self.attn_logit_softcapping)
@@ -254,14 +278,15 @@ class Gemma3p5Attention(nn.Module):
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
-        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(queries.dtype)
+        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(
+            queries.dtype
+        )
 
         output = mx.matmul(attn_weights, values)
 
         output = output.transpose(0, 2, 1, 3).reshape(input_shape + (-1,))
 
         return self.o_proj(output)
-
 
 
 class MLP(nn.Module):
@@ -297,6 +322,7 @@ class MLP(nn.Module):
         cutoff_x = inputs_mean + inputs_std * std_multiplier
         return mx.maximum(0, inputs - cutoff_x)
 
+
 class Gemma3p5AltUp(nn.Module):
     """Alternating Updates (AltUp)"""
 
@@ -305,9 +331,15 @@ class Gemma3p5AltUp(nn.Module):
         self.config = config
 
         self.correct_output_scale = mx.zeros((self.config.hidden_size,))
-        self.correction_coefs = nn.Linear(self.config.altup_num_inputs, self.config.altup_num_inputs, bias=False)
-        self.prediction_coefs = nn.Linear(self.config.altup_num_inputs, self.config.altup_num_inputs**2, bias=False)
-        self.modality_router = nn.Linear(self.config.hidden_size, self.config.altup_num_inputs, bias=False)
+        self.correction_coefs = nn.Linear(
+            self.config.altup_num_inputs, self.config.altup_num_inputs, bias=False
+        )
+        self.prediction_coefs = nn.Linear(
+            self.config.altup_num_inputs, self.config.altup_num_inputs**2, bias=False
+        )
+        self.modality_router = nn.Linear(
+            self.config.hidden_size, self.config.altup_num_inputs, bias=False
+        )
         self.router_norm = Gemma3p5RMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
@@ -317,7 +349,9 @@ class Gemma3p5AltUp(nn.Module):
         self._router_input_scale = mx.array(self.config.hidden_size**-1.0)
 
     def compute_router_modalities(self, x: mx.array) -> mx.array:
-        router_inputs = self.router_norm(x) * self._router_input_scale.astype(self.router_norm.weight.dtype)
+        router_inputs = self.router_norm(x) * self._router_input_scale.astype(
+            self.router_norm.weight.dtype
+        )
         routed = self.modality_router(router_inputs).astype(mx.float32)
         return mx.tanh(routed)
 
@@ -331,13 +365,17 @@ class Gemma3p5AltUp(nn.Module):
             self.prediction_coefs.weight = mx.clip(
                 self.prediction_coefs.weight,
                 -self.config.altup_coef_clip,
-                self.config.altup_coef_clip
+                self.config.altup_coef_clip,
             )
 
         # Fix: Use permute pattern that matches PyTorch exactly
         all_coefs = (
             self.prediction_coefs(modalities)
-            .reshape(*modalities.shape[:-1], self.config.altup_num_inputs, self.config.altup_num_inputs)
+            .reshape(
+                *modalities.shape[:-1],
+                self.config.altup_num_inputs,
+                self.config.altup_num_inputs,
+            )
             .transpose(0, 1, 3, 2)  # This should match PyTorch's permute(0, 1, 3, 2)
         )
 
@@ -345,7 +383,9 @@ class Gemma3p5AltUp(nn.Module):
         # PyTorch: hidden_states.float().permute(1, 2, 3, 0)
         x_permuted = x.astype(mx.float32).transpose(1, 2, 3, 0)
         predictions = mx.matmul(x_permuted, all_coefs)
-        predictions = predictions.transpose(3, 0, 1, 2)  # Match PyTorch's permute(3, 0, 1, 2)
+        predictions = predictions.transpose(
+            3, 0, 1, 2
+        )  # Match PyTorch's permute(3, 0, 1, 2)
         predictions += x
         return predictions.astype(x.dtype)
 
@@ -359,7 +399,7 @@ class Gemma3p5AltUp(nn.Module):
             self.correction_coefs.weight = mx.clip(
                 self.correction_coefs.weight,
                 -self.config.altup_coef_clip,
-                self.config.altup_coef_clip
+                self.config.altup_coef_clip,
             )
 
         # Fix: Match PyTorch's broadcasting approach instead of loop
@@ -371,7 +411,7 @@ class Gemma3p5AltUp(nn.Module):
         # Replicate innovation for all inputs like PyTorch
         innovation_expanded = mx.broadcast_to(
             mx.expand_dims(innovation, axis=0),
-            (self.config.altup_num_inputs,) + innovation.shape
+            (self.config.altup_num_inputs,) + innovation.shape,
         )
 
         # Fix: Match PyTorch's tensor manipulation
@@ -384,7 +424,6 @@ class Gemma3p5AltUp(nn.Module):
         corrected += predictions
 
         return corrected.astype(activated.dtype)
-
 
     def scale_corrected_output(self, corrected: mx.array):
         scale = self.correct_output_scale if self.config.altup_correct_scale else 1.0
@@ -425,11 +464,14 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
-
         self.altup = Gemma3p5AltUp(config)
         self.laurel = Gemma3p5LaurelBlock(config)
-        self.per_layer_input_gate = nn.Linear(self.hidden_size, self.hidden_size_per_layer_input, bias=False)
-        self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, self.hidden_size, bias=False)
+        self.per_layer_input_gate = nn.Linear(
+            self.hidden_size, self.hidden_size_per_layer_input, bias=False
+        )
+        self.per_layer_projection = nn.Linear(
+            self.hidden_size_per_layer_input, self.hidden_size, bias=False
+        )
         self.post_per_layer_input_norm = Gemma3p5RMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
@@ -448,7 +490,6 @@ class Gemma3p5DecoderLayer(nn.Module):
         if isinstance(x, list):
             x = mx.stack(x, axis=0)
 
-
         if self.is_sliding and mask is not None:  # efficient SDPA and no padding
             # In prefill, we may be larger than sliding window
             effective_seq_len = max(cache_position.shape[0], self.sliding_window)
@@ -466,15 +507,12 @@ class Gemma3p5DecoderLayer(nn.Module):
             offset = mx.clip(offset, a_min=0, a_max=None)
             # equivalent to: `attention_mask = attention_mask[:, :, :, offset : offset + effective_seq_len]`,
             # but without data-dependent slicing (i.e. torch.compile friendly)
-            mask_indexes = mx.arange(
-                min(effective_seq_len, mask.shape[-1])
-            )
+            mask_indexes = mx.arange(min(effective_seq_len, mask.shape[-1]))
             mask_indexes += offset
             mask = mask[:, :, :, mask_indexes.astype(mx.int32)]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
-
 
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
@@ -495,9 +533,10 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         attn = self.post_attention_layernorm(attn)
 
-
         attn_gated = active_prediction + attn
-        attn_laurel = (attn_gated + laurel_output) / mx.sqrt(mx.array(2.0, dtype=active_prediction.dtype))
+        attn_laurel = (attn_gated + laurel_output) / mx.sqrt(
+            mx.array(2.0, dtype=active_prediction.dtype)
+        )
 
         attn_norm = self.pre_feedforward_layernorm(attn_laurel)
         attn_ffw = self.mlp(attn_norm)
@@ -510,7 +549,6 @@ class Gemma3p5DecoderLayer(nn.Module):
         if self.config.altup_correct_scale:
             first_prediction = self.altup.scale_corrected_output(first_prediction)
 
-
         first_prediction = self.per_layer_input_gate(first_prediction)
         first_prediction = nn.gelu_approx(first_prediction)
 
@@ -518,7 +556,6 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         first_prediction = self.per_layer_projection(first_prediction)
         first_prediction = self.post_per_layer_input_norm(first_prediction)
-
 
         for i in range(1, len(corrected_predictions)):
             corrected_predictions[i] = corrected_predictions[i] + first_prediction
@@ -529,12 +566,19 @@ class Gemma3p5DecoderLayer(nn.Module):
 class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
     """This module overrides nn.Embeddings' forward by multiplying with embeddings scale."""
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, embed_scale: Optional[float] = 1.0):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        embed_scale: Optional[float] = 1.0,
+    ):
         super().__init__(num_embeddings, embedding_dim)
         self.embed_scale = embed_scale
 
     def __call__(self, x: mx.array):
-        return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(self.weight.dtype)
+        return super().__call__(x) * mx.array(self.embed_scale, mx.float32).astype(
+            self.weight.dtype
+        )
 
 
 class Gemma3Model(nn.Module):
@@ -561,7 +605,9 @@ class Gemma3Model(nn.Module):
         )
 
         self.per_layer_model_projection = nn.Linear(
-            config.hidden_size, config.num_hidden_layers * config.hidden_size_per_layer_input, bias=False
+            config.hidden_size,
+            config.num_hidden_layers * config.hidden_size_per_layer_input,
+            bias=False,
         )
 
         self.per_layer_projection_norm = Gemma3p5RMSNorm(
@@ -581,7 +627,12 @@ class Gemma3Model(nn.Module):
             for _ in range(1, self.config.altup_num_inputs)
         ]
 
-        self.norm = Gemma3p5RMSNorm(config.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True)
+        self.norm = Gemma3p5RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            scale_shift=0.0,
+            with_scale=True,
+        )
 
         self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
         self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
@@ -594,16 +645,19 @@ class Gemma3Model(nn.Module):
         attention_mask: mx.array,
         input_tensor: mx.array,
         cache_position: mx.array,
-        past_key_values: mx.array
+        past_key_values: mx.array,
     ):
-
 
         dtype = input_tensor.dtype
         sequence_length = input_tensor.shape[1]
         if isinstance(past_key_values[0], (_BaseCache)):
             target_length = self.config.sliding_window
         else:
-            target_length = attention_mask.shape[-1] if attention_mask is not None else input_tensor.shape[1]
+            target_length = (
+                attention_mask.shape[-1]
+                if attention_mask is not None
+                else input_tensor.shape[1]
+            )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
         causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
@@ -660,17 +714,16 @@ class Gemma3Model(nn.Module):
 
             if attention_mask is not None:
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = (
+                    causal_mask[:, :, :, :mask_length]
+                    + attention_mask[:, None, None, :]
+                )
                 padding_mask = padding_mask == 0
                 causal_mask[:, :, :, :mask_length] = mx.where(
-                    padding_mask,
-                    -mx.inf,
-                    causal_mask[:, :, :, :mask_length]
+                    padding_mask, -mx.inf, causal_mask[:, :, :, :mask_length]
                 )
 
-
         return causal_mask
-
 
     def __call__(
         self,
@@ -678,7 +731,7 @@ class Gemma3Model(nn.Module):
         inputs_embeds: mx.array = None,
         mask: mx.array = None,
         cache=None,
-        **kwargs
+        **kwargs,
     ):
         per_layer_inputs = kwargs.get("per_layer_inputs", None)
         h = self.embed_tokens(inputs)
@@ -690,7 +743,6 @@ class Gemma3Model(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
-
 
         cache_position = None
         if cache_position is None:
@@ -707,9 +759,7 @@ class Gemma3Model(nn.Module):
             h,
             cache_position,
             cache,
-
         )
-
 
         h0 = h
 
@@ -717,7 +767,6 @@ class Gemma3Model(nn.Module):
         position_ids = cache_position[None, :]
         position_embeddings_global = self.rope_embedding(h0, position_ids)
         position_embeddings_local = self.rope_embedding_local(h0, position_ids)
-
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
@@ -733,7 +782,9 @@ class Gemma3Model(nn.Module):
 
         h = mx.stack(h_list, axis=0)
 
-        for i, (layer, c) in enumerate(zip(self.layers[:self.config.num_hidden_layers], cache)):
+        for i, (layer, c) in enumerate(
+            zip(self.layers[: self.config.num_hidden_layers], cache)
+        ):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
             h = layer(
@@ -744,7 +795,7 @@ class Gemma3Model(nn.Module):
                 cache,
                 cache_position,
                 position_embeddings_global,
-                position_embeddings_local
+                position_embeddings_local,
             )
 
         # Per-layer inputs to single output
@@ -761,10 +812,14 @@ class Gemma3Model(nn.Module):
         return self.norm(h)
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
-        per_layer_inputs_mask = mx.logical_and(input_ids >= 0, input_ids < self.vocab_size)
+        per_layer_inputs_mask = mx.logical_and(
+            input_ids >= 0, input_ids < self.vocab_size
+        )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens).reshape(
-            *input_ids.shape, self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
         )
         return result
 
@@ -772,10 +827,14 @@ class Gemma3Model(nn.Module):
         self, inputs_embeds: mx.array, per_layer_inputs: Optional[mx.array] = None
     ) -> mx.array:
         per_layer_projection = self.per_layer_model_projection(inputs_embeds)
-        per_layer_projection *= self._per_layer_projection_scale.astype(inputs_embeds.dtype)
+        per_layer_projection *= self._per_layer_projection_scale.astype(
+            inputs_embeds.dtype
+        )
 
         per_layer_projection = per_layer_projection.reshape(
-            *inputs_embeds.shape[:-1], self.config.num_hidden_layers, self.config.hidden_size_per_layer_input
+            *inputs_embeds.shape[:-1],
+            self.config.num_hidden_layers,
+            self.config.hidden_size_per_layer_input,
         )
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
 
@@ -785,7 +844,9 @@ class Gemma3Model(nn.Module):
         if per_layer_projection.shape != per_layer_inputs.shape:
             per_layer_inputs = per_layer_inputs[..., : self.config.num_hidden_layers, :]
 
-        return (per_layer_projection + per_layer_inputs) * self._per_layer_input_scale.astype(inputs_embeds.dtype)
+        return (
+            per_layer_projection + per_layer_inputs
+        ) * self._per_layer_input_scale.astype(inputs_embeds.dtype)
 
 
 class LanguageModel(nn.Module):
@@ -803,9 +864,11 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
-        **kwargs
+        **kwargs,
     ):
-        out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs)
+        out = self.model(
+            inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
+        )
         out = self.lm_head(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
@@ -844,20 +907,23 @@ class LanguageModel(nn.Module):
             ):
                 caches.append(
                     StaticKVCache(
-                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings),
-
+                        max_size=min(
+                            self.config.sliding_window,
+                            self.config.max_position_embeddings,
+                        ),
                     )
                 )
             else:
                 caches.append(
                     SlidingWindowCache(
-                        max_size=min(self.config.sliding_window, self.config.max_position_embeddings),
+                        max_size=min(
+                            self.config.sliding_window,
+                            self.config.max_position_embeddings,
+                        ),
                     )
                 )
 
-
         return caches
-
 
 
 class SlidingWindowCache(_BaseCache):
@@ -870,7 +936,9 @@ class SlidingWindowCache(_BaseCache):
         self.values = None
         self.offset = 0
 
-    def update_and_fetch(self, keys: mx.array, values: mx.array) -> Tuple[mx.array, mx.array]:
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> Tuple[mx.array, mx.array]:
         B, n_kv_heads, seq_len, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
 
@@ -895,14 +963,16 @@ class SlidingWindowCache(_BaseCache):
             shift_amount = seq_len
             if shift_amount < self.max_size:
                 self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
-                self.values[:, :, :-shift_amount, :] = self.values[:, :, shift_amount:, :]
+                self.values[:, :, :-shift_amount, :] = self.values[
+                    :, :, shift_amount:, :
+                ]
                 # Add new tokens at the end
                 self.keys[:, :, -shift_amount:, :] = keys
                 self.values[:, :, -shift_amount:, :] = values
             else:
                 # New sequence is larger than cache, just keep the last max_size tokens
-                self.keys = keys[:, :, -self.max_size:, :]
-                self.values = values[:, :, -self.max_size:, :]
+                self.keys = keys[:, :, -self.max_size :, :]
+                self.values = values[:, :, -self.max_size :, :]
             self.offset = self.max_size
 
         return self.keys, self.values
@@ -919,8 +989,6 @@ class SlidingWindowCache(_BaseCache):
             self.keys, self.values = v
             if self.keys is not None:
                 self.offset = self.max_size
-
-
 
     def get_max_cache_shape(self):
         return self.max_size
@@ -950,7 +1018,9 @@ class StaticKVCache(_BaseCache):
         self.values = None
         self.offset = 0
 
-    def update_and_fetch(self, keys: mx.array, values: mx.array) -> Tuple[mx.array, mx.array]:
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> Tuple[mx.array, mx.array]:
         B, n_kv_heads, seq_len, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
 
@@ -966,8 +1036,22 @@ class StaticKVCache(_BaseCache):
         actual_seq_len = end_pos - self.offset
 
         if actual_seq_len > 0:
-            self.keys = mx.concatenate([self.keys[:, :, :self.offset, :], keys[:, :, :actual_seq_len, :], self.keys[:, :, end_pos:, :]], axis=2)
-            self.values = mx.concatenate([self.values[:, :, :self.offset, :], values[:, :, :actual_seq_len, :], self.values[:, :, end_pos:, :]], axis=2)
+            self.keys = mx.concatenate(
+                [
+                    self.keys[:, :, : self.offset, :],
+                    keys[:, :, :actual_seq_len, :],
+                    self.keys[:, :, end_pos:, :],
+                ],
+                axis=2,
+            )
+            self.values = mx.concatenate(
+                [
+                    self.values[:, :, : self.offset, :],
+                    values[:, :, :actual_seq_len, :],
+                    self.values[:, :, end_pos:, :],
+                ],
+                axis=2,
+            )
             self.offset = end_pos
 
         return self.keys, self.values
@@ -1001,4 +1085,3 @@ class StaticKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
-

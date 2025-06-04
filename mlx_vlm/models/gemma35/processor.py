@@ -1,12 +1,12 @@
 import inspect
-from typing import List, Optional, Union, Dict, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import AutoTokenizer, PreTrainedTokenizerBase, AutoProcessor
-from transformers.processing_utils import ProcessorMixin
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase
 from transformers.image_utils import ChannelDimension, PILImageResampling
+from transformers.processing_utils import ProcessorMixin
 from transformers.utils import logging
 
 from mlx_vlm.models.base import BaseImageProcessor, expand2square
@@ -36,13 +36,13 @@ class Gemma35ImageProcessor(BaseImageProcessor):
         do_center_crop: bool = False,
         crop_size=None,
         do_rescale: bool = True,
-        rescale_factor: float = 1/255.0,
+        rescale_factor: float = 1 / 255.0,
         do_normalize: bool = True,
         image_mean: Optional[Union[float, List[float]]] = GEMMA35_MEAN,
         image_std: Optional[Union[float, List[float]]] = GEMMA35_STD,
         do_convert_rgb: bool = True,
         do_pad_square: bool = False,
-        **kwargs
+        **kwargs,
     ):
         if isinstance(size, (tuple, list)):
             size = {"height": size[0], "width": size[1]}
@@ -55,7 +55,7 @@ class Gemma35ImageProcessor(BaseImageProcessor):
             size=(size["height"], size["width"]),
             resample=resample,
             rescale_factor=rescale_factor,
-            data_format=ChannelDimension.FIRST
+            data_format=ChannelDimension.FIRST,
         )
 
         self.do_resize = do_resize
@@ -81,7 +81,7 @@ class Gemma35ImageProcessor(BaseImageProcessor):
         do_convert_rgb: Optional[bool] = None,
         do_pad_square: Optional[bool] = None,
         return_tensors: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, mx.array]:
         """
         Preprocess an image or a batch of images for use with the Gemma35 model.
@@ -108,20 +108,32 @@ class Gemma35ImageProcessor(BaseImageProcessor):
 
         # Set default values based on instance attributes
         do_resize = do_resize if do_resize is not None else self.do_resize
-        do_center_crop = do_center_crop if do_center_crop is not None else self.do_center_crop
+        do_center_crop = (
+            do_center_crop if do_center_crop is not None else self.do_center_crop
+        )
         do_rescale = do_rescale if do_rescale is not None else self.do_rescale
         do_normalize = do_normalize if do_normalize is not None else self.do_normalize
-        do_convert_rgb = do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
-        do_pad_square = do_pad_square if do_pad_square is not None else self.do_pad_square
+        do_convert_rgb = (
+            do_convert_rgb if do_convert_rgb is not None else self.do_convert_rgb
+        )
+        do_pad_square = (
+            do_pad_square if do_pad_square is not None else self.do_pad_square
+        )
         resample = resample if resample is not None else self.resample
 
-        size = size if size is not None else {"height": self.size[0], "width": self.size[1]}
+        size = (
+            size
+            if size is not None
+            else {"height": self.size[0], "width": self.size[1]}
+        )
         if isinstance(size, (list, tuple)):
             size = {"height": size[0], "width": size[1]}
         elif isinstance(size, int):
             size = {"height": size, "width": size}
 
-        rescale_factor = rescale_factor if rescale_factor is not None else self.rescale_factor
+        rescale_factor = (
+            rescale_factor if rescale_factor is not None else self.rescale_factor
+        )
         image_mean = image_mean if image_mean is not None else self.image_mean
         image_std = image_std if image_std is not None else self.image_std
 
@@ -141,11 +153,7 @@ class Gemma35ImageProcessor(BaseImageProcessor):
 
             # Resize if needed
             if do_resize:
-                image = self.resize(
-                    image=image,
-                    size=size,
-                    resample=resample
-                )
+                image = self.resize(image=image, size=size, resample=resample)
 
             # Center crop if needed
             if do_center_crop:
@@ -162,9 +170,7 @@ class Gemma35ImageProcessor(BaseImageProcessor):
             # Normalize if needed
             if do_normalize:
                 image_array = self.normalize(
-                    image=image_array,
-                    mean=image_mean,
-                    std=image_std
+                    image=image_array, mean=image_mean, std=image_std
                 )
 
             # Transpose to channels-first format
@@ -193,18 +199,12 @@ class Gemma35Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
 
     def __init__(
-        self,
-        image_processor=None,
-        tokenizer=None,
-        chat_template=None,
-        **kwargs
+        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
     ):
         # Initialize image processor
         if image_processor is None:
             image_processor = Gemma35ImageProcessor()
         self.image_processor = image_processor
-
-
 
         # Initialize tokenizer
         if isinstance(tokenizer, str):
@@ -219,7 +219,6 @@ class Gemma35Processor(ProcessorMixin):
         # Instruct chat template
         self.tokenizer.chat_template = "\n{%- if messages[0]['role'] == 'system' -%}\n    {%- if messages[0]['content'] is string -%}\n        {%- set first_user_prefix = messages[0]['content'] + '\n\n' -%}\n    {%- else -%}\n        {%- set first_user_prefix = messages[0]['content'][0]['text'] + '\n\n' -%}\n    {%- endif -%}\n    {%- set loop_messages = messages[1:] -%}\n{%- else -%}\n    {%- set first_user_prefix = \"\" -%}\n    {%- set loop_messages = messages -%}\n{%- endif -%}\n{%- for message in loop_messages -%}\n    {%- if (message['role'] == 'user') != (loop.index0 % 2 == 0) -%}\n        {{ raise_exception(\"Conversation roles must alternate user/assistant/user/assistant/...\") }}\n    {%- endif -%}\n    {%- if (message['role'] == 'assistant') -%}\n        {%- set role = \"model\" -%}\n    {%- else -%}\n        {%- set role = message['role'] -%}\n    {%- endif -%}\n    {{ '<start_of_turn>' + role + '\n' + (first_user_prefix if loop.first else \"\") }}\n    {%- if message['content'] is string -%}\n        {{ message['content'] | trim }}\n    {%- elif message['content'] is iterable -%}\n        {%- for item in message['content'] -%}\n            {%- if item['type'] == 'image' -%}\n                {{ '<start_of_image>' }}\n            {%- elif item['type'] == 'text' -%}\n                {{ item['text'] | trim }}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- else -%}\n        {{ raise_exception(\"Invalid content type\") }}\n    {%- endif -%}\n    {{ '<end_of_turn>\n' }}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{'<start_of_turn>model\n'}}\n{%- endif -%}"
 
-
         # Set chat template if provided
         if chat_template is not None:
             if hasattr(self.tokenizer, "chat_template"):
@@ -233,7 +232,7 @@ class Gemma35Processor(ProcessorMixin):
         truncation: bool = True,
         max_length: Optional[int] = None,
         return_tensors: str = "mx",
-        **kwargs
+        **kwargs,
     ) -> Dict[str, mx.array]:
         """
         Process inputs for the Gemma35 model.
@@ -255,9 +254,7 @@ class Gemma35Processor(ProcessorMixin):
         # Process images if provided
         if images is not None:
             image_features = self.image_processor.preprocess(
-                images=images,
-                return_tensors=return_tensors,
-                **kwargs
+                images=images, return_tensors=return_tensors, **kwargs
             )
             processed_inputs.update(image_features)
 
@@ -270,7 +267,7 @@ class Gemma35Processor(ProcessorMixin):
                 truncation=truncation,
                 max_length=max_length,
                 return_tensors=return_tensors,
-                **kwargs
+                **kwargs,
             )
             processed_inputs.update(text_inputs)
 
@@ -296,9 +293,8 @@ class Gemma35Processor(ProcessorMixin):
             pretrained_model_name_or_path, **kwargs
         )
         image_processor = Gemma35ImageProcessor(**kwargs)
-        return Gemma35Processor(
-            image_processor=image_processor, tokenizer=tokenizer
-        )
+        return Gemma35Processor(image_processor=image_processor, tokenizer=tokenizer)
+
 
 # Register the processor with AutoProcessor
 MODEL_TYPE = "gemma35"

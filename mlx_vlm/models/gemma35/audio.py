@@ -1,5 +1,5 @@
-import math
 import inspect
+import math
 from dataclasses import dataclass
 from typing import Tuple, Union
 
@@ -42,7 +42,6 @@ class AudioConfig:
         )
 
 
-
 class Gemma3NanoAudioEmbedder(nn.Module):
     """Embeds token ids or soft tokens into language model space."""
 
@@ -50,13 +49,17 @@ class Gemma3NanoAudioEmbedder(nn.Module):
         super().__init__(*args, **kwargs)
 
         if (audio_config := config.audio_config) is None:
-            raise ValueError("`Gemma3p5Config` passed as `config` cannot have `audio_config=None`")
+            raise ValueError(
+                "`Gemma3p5Config` passed as `config` cannot have `audio_config=None`"
+            )
 
         self.audio_config: AudioConfig = audio_config
         self.text_config = config.text_config
         self.vocab_offset = vocab_offset
 
-        self.embedding = nn.Embedding(self.audio_config.vocab_size, self.audio_config.hidden_size)
+        self.embedding = nn.Embedding(
+            self.audio_config.vocab_size, self.audio_config.hidden_size
+        )
 
         self.hard_embedding_norm = Gemma3p5RMSNorm(
             dim=self.audio_config.hidden_size,
@@ -72,7 +75,9 @@ class Gemma3NanoAudioEmbedder(nn.Module):
             with_scale=True,
         )
 
-        self.embedding_projection = nn.Linear(self.audio_config.hidden_size, self.text_config.hidden_size, bias=False)
+        self.embedding_projection = nn.Linear(
+            self.audio_config.hidden_size, self.text_config.hidden_size, bias=False
+        )
 
         self.embedding_post_projection_norm = Gemma3p5RMSNorm(
             dim=self.text_config.hidden_size,
@@ -89,7 +94,9 @@ class Gemma3NanoAudioEmbedder(nn.Module):
             emb_norm = self.soft_embedding_norm(input_ids_or_embs)
         else:
             input_ids = input_ids_or_embs - self.vocab_offset
-            input_ids = mx.where(input_ids < 0, self.audio_config.vocab_size - 1, input_ids)
+            input_ids = mx.where(
+                input_ids < 0, self.audio_config.vocab_size - 1, input_ids
+            )
             hard_emb = self.embedding(input_ids)
             emb_norm = self.hard_embedding_norm(hard_emb)
 
@@ -375,9 +382,9 @@ class AudioAttention(nn.Module):
         prob_bun = probabilities.transpose(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
         v_bun = v_blocks.transpose(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
         result_bmm = mx.matmul(prob_bun, v_bun)
-        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).transpose(
-            0, 1, 3, 2, 4
-        )
+        context_vectors = result_bmm.reshape(
+            b_dim, u_dim, n_dim, w_dim, h_dim
+        ).transpose(0, 1, 3, 2, 4)
         context_vectors = context_vectors.reshape(
             (
                 batch_size,
@@ -572,7 +579,6 @@ class AudioModel(nn.Module):
             Gemma3p5AudioConformerBlock(config)
             for _ in range(config.conf_num_hidden_layers)
         ]
-
 
     def __call__(self, x: mx.array, mask: mx.array) -> Tuple[mx.array, mx.array]:
         x = self.subsample_conv_projection(x)
