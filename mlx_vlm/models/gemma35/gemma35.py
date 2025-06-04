@@ -178,6 +178,7 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
+        # Audio features
         input_features = kwargs.get("input_features", None)
 
         input_embeddings = self.get_input_embeddings(
