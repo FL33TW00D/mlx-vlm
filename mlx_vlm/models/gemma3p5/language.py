@@ -268,8 +268,7 @@ class Gemma3p5Attention(nn.Module):
 
         attn_weights = mx.matmul(queries, keys.swapaxes(2, 3)) * self.scale
 
-        if self.attn_logit_softcapping is not None:
-            print("softcap", self.attn_logit_softcapping)
+        if self.attn_logit_softcapping is not None and self.attn_logit_softcapping > 0:
             attn_weights = attn_weights / self.attn_logit_softcapping
             attn_weights = mx.tanh(attn_weights)
             attn_weights = attn_weights * self.attn_logit_softcapping
@@ -650,8 +649,21 @@ class Gemma3Model(nn.Module):
 
         dtype = input_tensor.dtype
         sequence_length = input_tensor.shape[1]
-        if isinstance(past_key_values[0], (_BaseCache)):
-            target_length = self.config.sliding_window
+
+        # Determine target length based on cache type
+        if past_key_values is not None and len(past_key_values) > 0:
+            if isinstance(past_key_values[0], (_BaseCache)):
+                # For cache-based generation, use the cache's current size
+                if past_key_values[0].keys is not None:
+                    target_length = past_key_values[0].keys.shape[2]
+                else:
+                    target_length = self.config.sliding_window
+            else:
+                target_length = (
+                    attention_mask.shape[-1]
+                    if attention_mask is not None
+                    else input_tensor.shape[1]
+                )
         else:
             target_length = (
                 attention_mask.shape[-1]
@@ -681,47 +693,44 @@ class Gemma3Model(nn.Module):
         **kwargs,
     ):
         """
-        Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
-        `(batch_size, key_value_length)`, or if the input `attention_mask` is already 4D, do nothing.
-
-        Args:
-            attention_mask (`torch.Tensor`):
-                A 2D attention mask of shape `(batch_size, key_value_length)` or a 4D attention mask of shape
-                `(batch_size, 1, query_length, key_value_length)`.
-            sequence_length (`int`):
-                The sequence length being processed.
-            target_length (`int`):
-                The target length: when generating with static cache, the mask should be as long as the static cache,
-                to account for the 0 padding, the part of the cache that is not filled yet.
-            dtype (`torch.dtype`):
-                The dtype to use for the 4D attention mask.
-            cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
-            batch_size (`torch.Tensor`):
-                Batch size.
+        Builds a (B,1,Q,K) mask filled with –∞ for:
+          • tokens to the *right* of every query token (causality)
+          • tokens that are *padding* (attention_mask == 0)
+        Allowed (attend-able) positions are exactly 0.0.
         """
 
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
-            causal_mask = attention_mask
-        else:
-            min_dtype = mx.finfo(dtype).min
-            causal_mask = mx.ones((sequence_length, target_length), dtype=dtype)
-            if sequence_length != 1:
-                causal_mask = mx.triu(causal_mask, k=1)
-            causal_mask *= mx.arange(target_length) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :]
+        min_dtype = mx.finfo(dtype).min
 
-            if attention_mask is not None:
-                mask_length = attention_mask.shape[-1]
-                padding_mask = (
-                    causal_mask[:, :, :, :mask_length]
-                    + attention_mask[:, None, None, :]
-                )
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = mx.where(
-                    padding_mask, -mx.inf, causal_mask[:, :, :, :mask_length]
-                )
+        # --- 1. causal part ---------------------------------------------------
+        # start with a matrix full of –∞ …
+        causal_mask = mx.full(
+            (sequence_length, target_length), min_dtype, dtype=dtype
+        )
+        # … then zero-out the main and lower triangle (q >= k)
+        if sequence_length != 1:
+            causal_mask = mx.triu(causal_mask, k=1)
+
+        # shift when we’re decoding with a static cache
+        causal_mask *= (
+            mx.arange(target_length) > cache_position.reshape(-1, 1)
+        )
+
+        # expand to (B,1,Q,K)
+        causal_mask = causal_mask[None, None, :, :].astype(dtype)
+        causal_mask = mx.repeat(causal_mask, repeats=batch_size, axis=0)
+
+        # --- 2. padding part --------------------------------------------------
+        if attention_mask is not None:          # (B,K)
+            # cast once so dtypes always match
+            pad = attention_mask.astype(dtype)
+
+            # pad == 0 indicates masked-out keys
+            pad = pad[:, None, None, :]         # (B,1,1,K)
+            causal_mask = mx.where(
+                pad == 0,                      # “is this key padding?”
+                min_dtype,                     # yes → ban it
+                causal_mask                    # no  → keep previous value
+            )
 
         return causal_mask
 
@@ -746,8 +755,9 @@ class Gemma3Model(nn.Module):
 
         cache_position = None
         if cache_position is None:
-
-            past_seen_tokens = cache[0].offset if cache is not None else 0
+            past_seen_tokens = 0
+            if cache is not None and cache[0] is not None:
+                past_seen_tokens = cache[0].offset
 
             cache_position = mx.arange(
                 past_seen_tokens,
