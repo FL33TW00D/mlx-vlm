@@ -644,95 +644,116 @@ class Gemma3Model(nn.Module):
         attention_mask: mx.array,
         input_tensor: mx.array,
         cache_position: mx.array,
-        past_key_values: mx.array,
+        past_key_values: list | None,
     ):
+        """
+        Build a 4-D (B,1,Q,K) mask that bans
+            • every key to the right of the current query token (causality)
+            • every key that is padding (attention_mask == 0)
+        and leaves allowed cells at 0 · 0.
+        """
 
-        dtype = input_tensor.dtype
-        sequence_length = input_tensor.shape[1]
+        dtype  = input_tensor.dtype
+        batch  = input_tensor.shape[0]
+        q_len  = input_tensor.shape[1]           # sequence_length
 
-        # Determine target length based on cache type
-        if past_key_values is not None and len(past_key_values) > 0:
-            if isinstance(past_key_values[0], (_BaseCache)):
-                # For cache-based generation, use the cache's current size
-                if past_key_values[0].keys is not None:
-                    target_length = past_key_values[0].keys.shape[2]
-                else:
-                    target_length = self.config.sliding_window
-            else:
-                target_length = (
-                    attention_mask.shape[-1]
-                    if attention_mask is not None
-                    else input_tensor.shape[1]
-                )
+        # -- determine how *wide* the mask must be ---------------------------
+        if (
+            past_key_values                                    # cache list exists
+            and isinstance(past_key_values[0], _BaseCache)     # our KV-cache class
+        ):
+            layer0 = past_key_values[0]
+
+            if layer0.keys is not None:                        # cache already filled
+                k_len = int(layer0.keys.shape[2])
+            else:                                              # first forward pass
+                k_len = int(layer0.max_size)                   # use full capacity
+
+            k_len = max(k_len, q_len)                          # safety for pre-fill
         else:
-            target_length = (
-                attention_mask.shape[-1]
+            k_len = (
+                int(attention_mask.shape[-1])
                 if attention_mask is not None
-                else input_tensor.shape[1]
+                else q_len
             )
 
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+        # -- build / return ---------------------------------------------------
+        return self._prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
+            sequence_length = q_len,
+            target_length   = k_len,
+            dtype           = dtype,
+            cache_position  = cache_position,
+            batch_size      = batch,
         )
-        return causal_mask
+
+
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: mx.array,
-        sequence_length: int,
-        target_length: int,
-        dtype: mx.float32,
-        cache_position: mx.array,
+        attention_mask: mx.array | None,   # (B ,K) or (B,1,Q,K) or None
+        sequence_length: int,              # Q
+        target_length:   int,              # K
+        dtype,
+        cache_position: mx.array,          # (Q,)  – indices of current tokens
         batch_size: int,
-        **kwargs,
     ):
         """
-        Builds a (B,1,Q,K) mask filled with –∞ for:
-          • tokens to the *right* of every query token (causality)
-          • tokens that are *padding* (attention_mask == 0)
-        Allowed (attend-able) positions are exactly 0.0.
+        Exact port of HF Gemma3 · 5 logic (2025-05-29).
+
+        Returned tensor shape → (B, 1, Q, K)   – values are 0.0 (keep) or
+        the minimum finite value of `dtype` (ban).
         """
+        # ------------------------------------------------------------------ #
+        #  if caller already gave us a 4-D “inverted” mask (Flex, FA2, …) we
+        #  trust it and short-circuit.
+        # ------------------------------------------------------------------ #
+        if attention_mask is not None and attention_mask.ndim == 4:
+            return attention_mask.astype(dtype)
 
-        min_dtype = mx.finfo(dtype).min
+        min_val = mx.finfo(dtype).min            # -∞  in chosen precision
 
-        # --- 1. causal part ---------------------------------------------------
-        # start with a matrix full of –∞ …
-        causal_mask = mx.full(
-            (sequence_length, target_length), min_dtype, dtype=dtype
-        )
-        # … then zero-out the main and lower triangle (q >= k)
+        # ------------------------------------------------------------------ #
+        # 1. causal part  – start full of -∞ then zero-out lower-triangle
+        # ------------------------------------------------------------------ #
+        causal = mx.full((sequence_length, target_length), min_val, dtype=dtype)
+
         if sequence_length != 1:
-            causal_mask = mx.triu(causal_mask, k=1)
+            causal = mx.triu(causal, k=1)        # keep q≥k at 0.0
 
-        # shift when we’re decoding with a static cache
-        causal_mask *= (
+        # static-cache shift: forbid keys that have *not* been written yet
+        # (i.e. k_index  >  cache_position[q])
+        causal *= (
             mx.arange(target_length) > cache_position.reshape(-1, 1)
         )
 
-        # expand to (B,1,Q,K)
-        causal_mask = causal_mask[None, None, :, :].astype(dtype)
-        causal_mask = mx.repeat(causal_mask, repeats=batch_size, axis=0)
+        # shape → (1,1,Q,K) then broadcast batch
+        causal = mx.expand_dims(causal, 0)       # (1,Q,K)
+        causal = mx.expand_dims(causal, 0)       # (1,1,Q,K)
+        causal = mx.repeat(causal, repeats=batch_size, axis=0).astype(dtype)
 
-        # --- 2. padding part --------------------------------------------------
-        if attention_mask is not None:          # (B,K)
-            # cast once so dtypes always match
-            pad = attention_mask.astype(dtype)
+        # ------------------------------------------------------------------ #
+        # 2. padding part  – turn “mask = 0” keys into -∞ inside the slice
+        # ------------------------------------------------------------------ #
+        if attention_mask is not None:           # (B,K)
+            Kmask_len  = int(attention_mask.shape[-1])
+            key_pad    = attention_mask.astype(dtype)            # 1/0
+            key_pad    = mx.expand_dims(key_pad, 1)               # (B,1,K)
+            key_pad    = mx.expand_dims(key_pad, 2)               # (B,1,1,K)
 
-            # pad == 0 indicates masked-out keys
-            pad = pad[:, None, None, :]         # (B,1,1,K)
-            causal_mask = mx.where(
-                pad == 0,                      # “is this key padding?”
-                min_dtype,                     # yes → ban it
-                causal_mask                    # no  → keep previous value
+            # slice only the prefix that overlaps real keys
+            causal_prefix = causal[:, :, :, :Kmask_len]
+            causal_prefix = mx.where(
+                key_pad == 0,                        #==> padding key?
+                min_val,                             # ban
+                causal_prefix                        # keep previous (0 or –∞)
+            )
+            causal = mx.concatenate(
+                [causal_prefix, causal[:, :, :, Kmask_len:]], axis=-1
             )
 
-        return causal_mask
+        return causal
+
 
     def __call__(
         self,

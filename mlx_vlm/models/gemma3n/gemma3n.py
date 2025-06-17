@@ -213,7 +213,7 @@ class Model(nn.Module):
 
             sanitized_weights[k] = v
 
-        sanitized_weights = {k: v for k, v in sanitized_weights.items() if "language_model" in k}
+        sanitized_weights = {k: v for k, v in sanitized_weights.items() if "vision_tower" not in k and "audio_tower" not in k and "embed_vision" not in k and "embed_audio" not in k}
         return sanitized_weights
 
     @staticmethod

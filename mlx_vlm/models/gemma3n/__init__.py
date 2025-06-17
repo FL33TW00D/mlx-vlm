@@ -1,4 +1,4 @@
-from .gemma3p5 import (
+from .gemma3n import (
     AudioConfig,
     AudioModel,
     LanguageModel,
@@ -8,4 +8,4 @@ from .gemma3p5 import (
     VisionConfig,
     VisionModel,
 )
-# from .processor import Gemma35Processor
+
