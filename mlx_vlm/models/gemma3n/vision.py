@@ -6,31 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .language import Gemma3p5RMSNorm
-
-
-@dataclass
-class VisionConfig:
-    model_type: str = "siglip_vision_model"
-    num_hidden_layers: int = 12
-    hidden_size: int = 2048
-    intermediate_size: int = 8192
-    num_attention_heads: int = 16
-    patch_size: int = 16
-    image_size: int = 224
-    num_channels: int = 3
-    layer_norm_eps: float = 1e-6
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
+from .language import Gemma3nRMSNorm
+from .config import VisionConfig
 
 def check_array_shape(arr):
     shape = arr.shape

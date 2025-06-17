@@ -9,53 +9,11 @@ from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
 from ..cache import ChunkedKVCache, KVCache, RotatingKVCache
+from .config import TextConfig
 
 
-@dataclass
-class TextConfig:
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int = 2
-    head_dim: int = 256
-    rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
-    num_key_value_heads: int = 4
-    laurel_rank: int = 64
-    frac_shared_layers: float = 0.5
-    altup_active_idx: int = 0
-    altup_num_inputs: int = 4
-    altup_coef_clip: Optional[float] = None
-    altup_correct_scale: bool = True
-    hidden_size_per_layer_input: int = 1024
-    rope_local_base_freq: float = 10000.0
-    rope_traditional: bool = False
-    rope_theta: float = 1000000.0
-    query_pre_attn_scalar: float = 0.0625
-    sliding_window: int = 1024
-    rope_scaling: Optional[Dict[str, Union[float, List[float]]]] = None
-    mm_tokens_per_image: int = 256
-    sliding_window_pattern: int = 5
-    activation_sparsity_pattern: Optional[List[float]] = None
-    final_logit_softcapping: float = 30.0
-    query_rescale_scalar: float = 1.0
-    num_kv_shared_layers: int = 0
-    max_position_embeddings: int = 32768
-    attn_logit_softcapping: float = 0.0
 
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
-
-
-class Gemma3p5RMSNorm(nn.Module):
+class Gemma3nRMSNorm(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -90,7 +48,7 @@ class Gemma3p5RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Gemma3p5LaurelBlock(nn.Module):
+class Gemma3nLaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
 
     def __init__(self, config: TextConfig):
@@ -103,7 +61,7 @@ class Gemma3p5LaurelBlock(nn.Module):
         self.linear_right = nn.Linear(
             self.config.laurel_rank, self.config.hidden_size, bias=False
         )
-        self.post_laurel_norm = Gemma3p5RMSNorm(
+        self.post_laurel_norm = Gemma3nRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             scale_shift=0.0,
@@ -136,7 +94,7 @@ def apply_rotary_pos_emb(
     return (x * cos) + (rotate_half(x) * sin)
 
 
-class Gemma3p5RotaryEmbedding(nn.Module):
+class Gemma3nRotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig, device=None):
         super().__init__()
 
@@ -176,7 +134,7 @@ class Gemma3p5RotaryEmbedding(nn.Module):
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-class Gemma3p5Attention(nn.Module):
+class Gemma3nAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern
@@ -196,7 +154,7 @@ class Gemma3p5Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.qkv_norm = Gemma3p5RMSNorm(
+        self.qkv_norm = Gemma3nRMSNorm(
             dim=config.head_dim,
             eps=config.rms_norm_eps,
             scale_shift=0.0,
@@ -320,7 +278,7 @@ class MLP(nn.Module):
         return mx.maximum(0, inputs - cutoff_x)
 
 
-class Gemma3p5AltUp(nn.Module):
+class Gemma3nAltUp(nn.Module):
     """Alternating Updates (AltUp)"""
 
     def __init__(self, config: TextConfig):
@@ -337,7 +295,7 @@ class Gemma3p5AltUp(nn.Module):
         self.modality_router = nn.Linear(
             self.config.hidden_size, self.config.altup_num_inputs, bias=False
         )
-        self.router_norm = Gemma3p5RMSNorm(
+        self.router_norm = Gemma3nRMSNorm(
             dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             scale_shift=0.0,
@@ -435,25 +393,25 @@ class Gemma3p5AltUp(nn.Module):
         return corrected, output
 
 
-class Gemma3p5DecoderLayer(nn.Module):
+class Gemma3nDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        self.self_attn = Gemma3p5Attention(config, layer_idx)
+        self.self_attn = Gemma3nAttention(config, layer_idx)
         self.mlp = MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = Gemma3p5RMSNorm(
+        self.input_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
 
-        self.post_attention_layernorm = Gemma3p5RMSNorm(
+        self.post_attention_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
-        self.pre_feedforward_layernorm = Gemma3p5RMSNorm(
+        self.pre_feedforward_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
-        self.post_feedforward_layernorm = Gemma3p5RMSNorm(
+        self.post_feedforward_layernorm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
         self.is_sliding = self.self_attn.is_sliding
@@ -461,15 +419,15 @@ class Gemma3p5DecoderLayer(nn.Module):
 
         self.hidden_size_per_layer_input = config.hidden_size_per_layer_input
 
-        self.altup = Gemma3p5AltUp(config)
-        self.laurel = Gemma3p5LaurelBlock(config)
+        self.altup = Gemma3nAltUp(config)
+        self.laurel = Gemma3nLaurelBlock(config)
         self.per_layer_input_gate = nn.Linear(
             self.hidden_size, self.hidden_size_per_layer_input, bias=False
         )
         self.per_layer_projection = nn.Linear(
             self.hidden_size_per_layer_input, self.hidden_size, bias=False
         )
-        self.post_per_layer_input_norm = Gemma3p5RMSNorm(
+        self.post_per_layer_input_norm = Gemma3nRMSNorm(
             self.hidden_size, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=True
         )
 
@@ -560,7 +518,7 @@ class Gemma3p5DecoderLayer(nn.Module):
         return corrected_predictions
 
 
-class Gemma3p5TextScaledWordEmbedding(nn.Embedding):
+class Gemma3nTextScaledWordEmbedding(nn.Embedding):
     """This module overrides nn.Embeddings' forward by multiplying with embeddings scale."""
 
     def __init__(
@@ -587,15 +545,15 @@ class Gemma3Model(nn.Module):
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
 
-        self.embed_tokens = Gemma3p5TextScaledWordEmbedding(
+        self.embed_tokens = Gemma3nTextScaledWordEmbedding(
             config.vocab_size, config.hidden_size, embed_scale=config.hidden_size**0.5
         )
         self.layers = [
-            Gemma3p5DecoderLayer(config=config, layer_idx=layer_idx)
+            Gemma3nDecoderLayer(config=config, layer_idx=layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ]
 
-        self.embed_tokens_per_layer = Gemma3p5TextScaledWordEmbedding(
+        self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
             config.vocab_size,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             embed_scale=config.hidden_size_per_layer_input**0.5,
@@ -607,7 +565,7 @@ class Gemma3Model(nn.Module):
             bias=False,
         )
 
-        self.per_layer_projection_norm = Gemma3p5RMSNorm(
+        self.per_layer_projection_norm = Gemma3nRMSNorm(
             dim=config.hidden_size_per_layer_input,
             eps=config.rms_norm_eps,
             scale_shift=0.0,
@@ -624,7 +582,7 @@ class Gemma3Model(nn.Module):
             for _ in range(1, self.config.altup_num_inputs)
         ]
 
-        self.norm = Gemma3p5RMSNorm(
+        self.norm = Gemma3nRMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             scale_shift=0.0,
@@ -634,8 +592,8 @@ class Gemma3Model(nn.Module):
         self._per_layer_projection_scale = mx.array(self.hidden_size**-0.5)
         self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
 
-        self.rope_embedding = Gemma3p5RotaryEmbedding(config)
-        self.rope_embedding_local = Gemma3p5RotaryEmbedding(config)
+        self.rope_embedding = Gemma3nRotaryEmbedding(config)
+        self.rope_embedding_local = Gemma3nRotaryEmbedding(config)
 
     def _update_causal_mask(
         self,

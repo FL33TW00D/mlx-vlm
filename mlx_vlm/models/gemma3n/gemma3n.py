@@ -9,73 +9,14 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from .audio import AudioConfig, AudioModel, Gemma3NanoAudioEmbedder
-from .language import Gemma3p5RMSNorm, LanguageModel, TextConfig
+from .audio import AudioConfig, AudioModel, Gemma3nAudioEmbedder
+from .language import LanguageModel, TextConfig
 from .vision import Gemma3p5VisionEmbedder, VisionConfig, VisionModel
+from .config import ModelConfig
 
 
-@dataclass
-class ModelConfig:
-    text_config: TextConfig
-    vision_config: VisionConfig
-    model_type: str
-    vocab_size: int = 257152
-    ignore_index: int = -100
-    image_token_index: int = 257152
-    hidden_size: int = 2048
-    pad_token_id: int = 0
-    eos_token_id: Optional[List[int]] = None
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
-class Gemma3MultiModalProjector(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.mm_input_projection_weight = mx.ones(
-            (config.vision_config.hidden_size, config.text_config.hidden_size)
-        )
-
-        self.mm_soft_emb_norm = Gemma3p5RMSNorm(
-            config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
-        )
-        self.patches_per_image = int(
-            config.vision_config.image_size // config.vision_config.patch_size
-        )
-        self.tokens_per_side = int(config.text_config.mm_tokens_per_image**0.5)
-        self.kernel_size = self.patches_per_image // self.tokens_per_side
-        self.avg_pool = nn.AvgPool2d(
-            kernel_size=self.kernel_size, stride=self.kernel_size
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        b, _, l = x.shape
-
-        reshaped_vision_outputs = x.transpose(0, 2, 1)
-        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
-            b, l, self.patches_per_image, self.patches_per_image
-        )
-
-        # Transpose to place h, w in indices 1, 2
-        reshaped_vision_outputs = reshaped_vision_outputs.transpose(0, 2, 3, 1)
-        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
-        pooled_vision_outputs = pooled_vision_outputs.transpose(0, 3, 1, 2).flatten(2)
-        pooled_vision_outputs = pooled_vision_outputs.transpose(0, 2, 1)
-
-        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
-
-        projected_vision_outputs = mx.einsum(
-            "btm,md->btd", normed_vision_outputs, self.mm_input_projection_weight
-        )
-        return projected_vision_outputs.astype(x.dtype)
 
 
 class Model(nn.Module):
@@ -83,6 +24,7 @@ class Model(nn.Module):
         super().__init__()
         self.model_type = config.model_type
         self.config = config
+
 
         # Text
         self.language_model = LanguageModel(config.text_config)
@@ -92,8 +34,8 @@ class Model(nn.Module):
         # self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
 
         # # Audio
-        # self.audio_tower = AudioModel(config.audio_config)
-        # self.embed_audio = Gemma3NanoAudioEmbedder(config.audio_config)
+        self.audio_tower = AudioModel(config.audio_config)
+        self.embed_audio = Gemma3nAudioEmbedder(config)
 
     def embed(self, input_ids):
         text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
@@ -192,10 +134,9 @@ class Model(nn.Module):
         # Audio features
         input_features = kwargs.get("input_features", None)
 
-        # input_embeddings = self.get_input_embeddings(
-        #     input_ids, pixel_values, input_features
-        # )
-        input_embeddings = self.language_model.model.embed_tokens(input_ids)
+        input_embeddings = self.get_input_embeddings(
+            input_ids, pixel_values, input_features
+        )
 
         logits = self.language_model(
             inputs=input_ids,
@@ -205,15 +146,7 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        sanitized_weights = {}
-
-        for k, v in weights.items():
-            if "language_model" not in k:
-                k = "language_model." + k
-
-            sanitized_weights[k] = v
-
-        sanitized_weights = {k: v for k, v in sanitized_weights.items() if "vision_tower" not in k and "audio_tower" not in k and "embed_vision" not in k and "embed_audio" not in k}
+        sanitized_weights = {k: v for k, v in weights.items() if "vision_tower" not in k and "embed_vision" not in k}
         return sanitized_weights
 
     @staticmethod
