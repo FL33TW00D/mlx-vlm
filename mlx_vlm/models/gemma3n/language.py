@@ -261,8 +261,6 @@ class Gemma3p5Attention(nn.Module):
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
 
-        # output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
-
         keys = mx.repeat(keys, repeats=self.repeats, axis=1)
         values = mx.repeat(values, repeats=self.repeats, axis=1)
 
@@ -801,7 +799,7 @@ class Gemma3Model(nn.Module):
 
         # Expand hidden_states to support per-layer inputs
         target_magnitude = mx.mean(h0**2, axis=-1, keepdims=True) ** 0.5
-        epsilon_tensor = mx.array(1e-10, dtype=h0.dtype)
+        epsilon_tensor = mx.array(mx.finfo(h0.dtype).min, dtype=h0.dtype)
 
         h_list = [h0] * self.config.altup_num_inputs
 
