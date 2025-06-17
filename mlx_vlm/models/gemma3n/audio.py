@@ -263,7 +263,7 @@ class Gemma3nAudioAttention(nn.Module):
 
         q_scale = self.head_dim**-0.5
         r_softplus_0 = 1.0 / nn.softplus(mx.array(0.0))
-        self.q_scale = q_scale * r_softplus_0
+        self._q_scale = q_scale * r_softplus_0
 
         lower_causal_mask = mx.tril(
             mx.ones((self.context_size, self.chunk_size), dtype=mx.bool_),
@@ -361,7 +361,7 @@ class Gemma3nAudioAttention(nn.Module):
 
         broadcast_shape = (1, 1, 1, self.head_dim)
         per_dim_scale_sp_broadcast = per_dim_scale_sp.reshape(broadcast_shape)
-        query_states = query_states * self.q_scale * per_dim_scale_sp_broadcast
+        query_states = query_states * self._q_scale * per_dim_scale_sp_broadcast
 
         batch_size, q_time = query_states.shape[:2]
 
@@ -777,23 +777,19 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         self.ffw_layer_1 = nn.Linear(self.config.hidden_size, self.config.hidden_size * 4, bias=False)
         self.ffw_layer_2 = nn.Linear(self.config.hidden_size * 4, self.config.hidden_size, bias=False)
         self.post_layer_norm = Gemma3nRMSNorm(self.config.hidden_size)
-        self.post_layer_scale = mx.array(self.config.conf_residual_weight)
+        self._post_layer_scale = mx.array(self.config.conf_residual_weight)
 
     def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        audio_encodings_input_to_attn = x
-        audio_encodings = mx.clip(x, -self._gradient_clipping, self.gradient_clipping)
-        audio_encodings_norm = self.pre_attn_norm(audio_encodings)
-        # Output of self.attn is [B, T, NumHeads, HeadDim]
-        audio_encodings_attn_out = self.attn(audio_encodings_norm, audio_mel_mask)
+        residual = x
+        x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
+        x = self.pre_layer_norm(x)
+        audio_encodings: mx.array = self.ffw_layer_1(audio_encodings)  # jax.numpy.einsum("...a,ab->...b")
+        audio_encodings = nn.functional.silu(audio_encodings)  # Add SiLU (Swish) activation
+        audio_encodings: mx.array = self.ffw_layer_2(audio_encodings)  # jax.numpy.einsum("...a,ab->...b")
+        audio_encodings = mx.clip(audio_encodings, -self._gradient_clipping, self._gradient_clipping)
+        audio_encodings = self.post_layer_norm(audio_encodings)
+        return residual + (audio_encodings * self._post_layer_scale)
 
-        # Reshape from [B, T, NumHeads, HeadDim] to [B, T, NumHeads * HeadDim]
-        # NumHeads * HeadDim = hidden_size
-        b, t, num_heads, head_dim = audio_encodings_attn_out.shape
-        audio_encodings_reshaped = audio_encodings_attn_out.reshape(b, t, num_heads * head_dim)
-
-        audio_encodings = self.post(audio_encodings_reshaped)
-        audio_encodings = mx.clip(audio_encodings, -self._gradient_clipping, self.gradient_clipping)
-        return audio_encodings_input_to_attn + self.post_norm(audio_encodings)
 
 
 
@@ -947,3 +943,14 @@ class AudioModel(nn.Module):
 
         audio_encodings = mx.where(current_mask[..., None], 0.0, audio_encodings)
         return audio_encodings, current_mask
+
+    def sanitize(self, weights):
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "conv.weight" in k:
+
+                v = v.transpose(0, 2, 3, 1)
+            if "conv1d.weight" in k:
+                v = v.transpose(0, 2, 1)
+            sanitized_weights[k] = v
+        return sanitized_weights

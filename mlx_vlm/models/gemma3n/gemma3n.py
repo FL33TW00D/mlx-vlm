@@ -16,9 +16,6 @@ from .config import ModelConfig
 
 
 
-
-
-
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -41,12 +38,12 @@ class Model(nn.Module):
         text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
         inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
 
-        vision_embeds = self.embed_vision(input_ids)
-        inputs_embeds = mx.where(
-            input_ids[..., None] < self.embed_vision.vocab_offset,
-            inputs_embeds,
-            vision_embeds,
-        )
+        # vision_embeds = self.embed_vision(input_ids)
+        # inputs_embeds = mx.where(
+        #     input_ids[..., None] < self.embed_vision.vocab_offset,
+        #     inputs_embeds,
+        #     vision_embeds,
+        # )
 
         audio_embeds = self.embed_audio(input_ids)
         inputs_embeds = mx.where(
@@ -67,11 +64,11 @@ class Model(nn.Module):
 
         inputs_embeds = self.embed(input_ids)
 
-        if pixel_values is not None:
-            image_features = self.get_image_features(pixel_values)
-            return self.merge_multimodal_and_text(
-                input_ids, inputs_embeds, image_features, self.config.image_token_id
-            )
+        # if pixel_values is not None:
+        #     image_features = self.get_image_features(pixel_values)
+        #     return self.merge_multimodal_and_text(
+        #         input_ids, inputs_embeds, image_features, self.config.image_token_id
+        #     )
 
         if input_features is not None:
             audio_outputs = self.get_audio_features(input_features)
@@ -131,6 +128,8 @@ class Model(nn.Module):
         cache: Optional[mx.array] = None,
         **kwargs,
     ):
+
+        print(kwargs)
         # Audio features
         input_features = kwargs.get("input_features", None)
 
