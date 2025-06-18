@@ -862,13 +862,24 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
-        if "lm_head.weight" not in weights:
-            weights["language_model.lm_head.weight"] = weights[
-                "language_model.model.embed_tokens.weight"
-            ]
-        return {
-            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
-        }
+        sanitized_weights = {}
+
+        for k, v in weights.items():
+            if "language_model" in k:
+                new_key = k.replace("language_model", "language_model.model")
+                sanitized_weights[new_key] = v
+            elif "self_attn.rotary_emb.inv_freq" in k:
+                continue
+            else:
+                sanitized_weights[k] = v
+
+
+        if "lm_head.weight" not in sanitized_weights:
+            embed_tokens_key = "language_model.model.embed_tokens.weight"
+            if embed_tokens_key in sanitized_weights:
+                sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[embed_tokens_key]
+
+        return sanitized_weights
 
     @property
     def layers(self):
