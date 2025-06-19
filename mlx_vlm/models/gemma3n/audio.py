@@ -85,16 +85,20 @@ class Gemma3nAudioEmbedder(nn.Module):
         )
 
     def __call__(
-        self, input_ids_or_embs: mx.array, is_soft_embedding: bool = False
+        self, input_ids: mx.array = None, inputs_embeds: mx.array = None
     ) -> mx.array:
 
-        if is_soft_embedding:
-            emb_norm = self.soft_embedding_norm(input_ids_or_embs)
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is not None:
+            emb_norm = self.soft_embedding_norm(inputs_embeds)
         else:
-            input_ids = input_ids_or_embs - self.vocab_offset
-            input_ids = mx.where(
-                input_ids < 0, self.audio_config.vocab_size - 1, input_ids
-            )
+            out_of_vocab_id = self.audio_config.vocab_size - 1
+            input_ids = input_ids - self.vocab_offset
+            input_ids = mx.where(input_ids < 0, out_of_vocab_id, input_ids)
+            input_ids = mx.where(input_ids >= self.audio_config.vocab_size, out_of_vocab_id, input_ids)
             hard_emb = self.embedding(input_ids)
             emb_norm = self.hard_embedding_norm(hard_emb)
 
@@ -272,11 +276,8 @@ class Gemma3nAudioAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
 
         self.chunk_size = self.config.conf_attention_chunk_size
-        # self.max_past_horizon = self.config.conf_attention_context_left
         self.max_future_horizon = self.config.conf_attention_context_right
-        self.max_past_horizon = (
-            self.config.conf_attention_context_left - 1 if self.config.conf_attention_context_left > 0 else 0
-        )
+        self.max_past_horizon = max(0, self.config.conf_attention_context_left - 1)
         self.attention_invalid_logits_value = self.config.conf_attention_invalid_logits_value
         self.attention_logits_soft_cap = self.config.conf_attention_logit_cap
         self.context_size = self.chunk_size + self.max_past_horizon + self.max_future_horizon
@@ -885,7 +886,6 @@ class Gemma3nAudioConformerBlock(nn.Module):
         )
         audio_encodings = self.lconv1d(audio_encodings_for_lconv_input)
 
-        # audio_encodings = self.lconv1d(audio_encodings)
         audio_encodings = self.ffw_layer_end(audio_encodings)
         audio_encodings = mx.clip(audio_encodings, -self._gradient_clipping, self._gradient_clipping)
         output = self.norm(audio_encodings)
@@ -936,7 +936,7 @@ class AudioModel(nn.Module):
 
         # Fallback: Ensure mask length matches feature length after gather.
         if current_mask.shape[1] != t_sub:
-            logger.warning(
+            print(
                 "Warning: Subsampled mask length %s mismatch with feature length %s after gather. Adjusting.",
                 current_mask.shape[1],
                 t_sub,
@@ -949,6 +949,7 @@ class AudioModel(nn.Module):
 
         for i, block in enumerate(self.conformer):
             audio_encodings = block(audio_encodings, current_mask)  # Pass the processed mask
+
 
         if self.config.conf_reduction_factor > 1:
             audio_encodings = audio_encodings[:, :: self.config.conf_reduction_factor]
@@ -973,7 +974,6 @@ class AudioModel(nn.Module):
         sanitized_weights = {}
         for k, v in weights.items():
             if "conv.weight" in k:
-
                 v = v.transpose(0, 2, 3, 1)
             if "conv1d.weight" in k:
                 v = v.transpose(0, 2, 1)
