@@ -2,6 +2,7 @@ import inspect
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+import copy
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -593,6 +594,10 @@ class Gemma3Model(nn.Module):
         self._per_layer_input_scale = mx.rsqrt(mx.array(2.0))
 
         self.rope_embedding = Gemma3nRotaryEmbedding(config)
+
+        config = copy.deepcopy(config)
+        config.rope_theta = config.rope_local_base_freq
+        config.rope_scaling = {"rope_type": "default"}
         self.rope_embedding_local = Gemma3nRotaryEmbedding(config)
 
     def _update_causal_mask(
