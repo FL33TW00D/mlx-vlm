@@ -290,7 +290,9 @@ class Gemma3nAudioAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
 
         q_scale = self.head_dim**-0.5
-        r_softplus_0 = 1.0 / nn.softplus(mx.array(0.0))
+        # Fix: Implement softplus manually since nn.softplus doesn't exist in MLX
+        # softplus(x) = log(1 + exp(x))
+        r_softplus_0 = 1.0 / mx.log1p(mx.exp(mx.array(0.0)))
         self._q_scale = q_scale * r_softplus_0
 
         lower_causal_mask = mx.tril(
@@ -384,7 +386,7 @@ class Gemma3nAudioAttention(nn.Module):
         key_states = self.k_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
         value_states = self.v_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
 
-        per_dim_scale_sp = nn.softplus(self.per_dim_scale)
+        per_dim_scale_sp = mx.log1p(mx.exp(self.per_dim_scale))
 
         broadcast_shape = (1, 1, 1, self.head_dim)
         per_dim_scale_sp_broadcast = per_dim_scale_sp.reshape(broadcast_shape)
@@ -783,15 +785,20 @@ class Gemma3nAudioConformerAttention(nn.Module):
         self.post_norm = Gemma3nRMSNorm(self.config.hidden_size)
 
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
+        audio_encodings_input_to_attn = x
+        x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
         x = self.pre_attn_norm(x)
+        # Output of self.attn is [B, T, NumHeads, HeadDim]
         x = self.attn(x, mask)
 
-        batch_dims = x.shape[: -len(self.post_in_shape)]
-        x_flat = x.reshape(-1, self.post_in_features)
-        output_flat: mx.array = self.post(x_flat)
-        x = output_flat.reshape(*batch_dims, self.config.hidden_size)
+        # Reshape from [B, T, NumHeads, HeadDim] to [B, T, NumHeads * HeadDim]
+        # NumHeads * HeadDim = hidden_size
+        b, t, num_heads, head_dim = x.shape
+        x = x.reshape(b, t, num_heads * head_dim)
 
-        return self.post_norm(x)
+        x = self.post(x)
+        x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
+        return audio_encodings_input_to_attn + self.post_norm(x)
 
 
 class Gemma3nAudioConformerFeedForward(nn.Module):
@@ -807,7 +814,7 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         self.post_layer_norm = Gemma3nRMSNorm(self.config.hidden_size)
         self._post_layer_scale = mx.array(self.config.conf_residual_weight)
 
-    def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+    def __call__(self, x: mx.array) -> mx.array:
         residual = x
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
         x = self.pre_layer_norm(x)
