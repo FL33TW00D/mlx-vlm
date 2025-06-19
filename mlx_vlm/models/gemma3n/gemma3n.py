@@ -58,6 +58,8 @@ class Model(nn.Module):
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
+        input_features_mask: Optional[mx.array] = None,
+        **kwargs,
     ):
         if pixel_values is None and input_features is None:
             return self.embed(input_ids)
@@ -71,13 +73,13 @@ class Model(nn.Module):
         #     )
 
         if input_features is not None:
-            audio_outputs = self.get_audio_features(input_features)
+            audio_outputs = self.get_audio_features(input_features, input_features_mask)
             return self.merge_multimodal_and_text(
                 input_ids, inputs_embeds, audio_outputs, self.config.audio_token_id
             )
 
-    def get_audio_features(self, input_features):
-        audio_outputs, _, _ = self.audio_tower(input_features)
+    def get_audio_features(self, input_features, input_features_mask):
+        audio_outputs, _ = self.audio_tower(input_features, input_features_mask)
         return self.embed_audio(audio_outputs, is_soft_embedding=True)
 
     def get_image_features(self, pixel_values):
@@ -100,7 +102,7 @@ class Model(nn.Module):
             special_image_mask = (
                 inputs_embeds
                 == self.language_model.model.embed_tokens(
-                    mx.tensor(token_id, dtype=mx.long)
+                    mx.array([token_id])
                 )
             )
         else:
@@ -109,12 +111,15 @@ class Model(nn.Module):
                 special_image_mask, inputs_embeds.shape
             )
 
-        if inputs_embeds[special_image_mask].size != features.size:
-            image_tokens_in_text = (special_image_mask).sum(dim=1).sum(dim=0)[0]
+        # Count special tokens by summing the mask
+        special_token_count = mx.sum(special_image_mask[..., 0] if special_image_mask.ndim > 2 else special_image_mask)
+        expected_feature_count = features.shape[0] * features.shape[1] if features.ndim > 1 else features.shape[0]
+
+        if special_token_count != expected_feature_count:
             raise ValueError(
                 f"Number of images does not match number of special image tokens in the input text. "
-                f"Got {image_tokens_in_text} image tokens in the text and "
-                f"{features.shape[0] * features.shape[1]} tokens from image embeddings."
+                f"Got {special_token_count} (image/audio) tokens in the text and "
+                f"{expected_feature_count} tokens from (image/audio) embeddings."
             )
         features = features.astype(inputs_embeds.dtype)
         inputs_embeds = mx.where(special_image_mask, features.flatten(), inputs_embeds)
@@ -129,12 +134,11 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        print(kwargs)
         # Audio features
-        input_features = kwargs.get("input_features", None)
-
+        input_features = kwargs.pop("input_features", None)
+        input_features_mask = kwargs.pop("input_features_mask", None)
         input_embeddings = self.get_input_embeddings(
-            input_ids, pixel_values, input_features
+            input_ids=input_ids, pixel_values=pixel_values, input_features=input_features, input_features_mask=input_features_mask, **kwargs
         )
 
         logits = self.language_model(
