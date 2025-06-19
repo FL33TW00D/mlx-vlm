@@ -19,35 +19,32 @@ class Gemma3nRMSNorm(nn.Module):
         self,
         dim: int,
         eps: float = 1e-6,
-        scale_shift: float = 1.0,
+        scale_shift: float = 0.0,
         with_scale: bool = True,
     ):
+        super().__init__()
         self.eps = eps
         self.scale_shift = scale_shift
         self.with_scale = with_scale
+
         if self.with_scale:
+            # Make weight a proper parameter
             self.weight = mx.ones(dim)
+        else:
+            self.weight = None
+
+    def _norm(self, x):
+        # Match PyTorch's normalization exactly
+        return x * mx.rsqrt(x.square().mean(axis=-1, keepdims=True) + self.eps)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Compute variance along last dimension
-        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
-        # Normalize
-        normed = x / mx.sqrt(variance + self.eps)
+        # Match PyTorch implementation
+        output = self._norm(x.astype(mx.float32))
 
-        # Apply weight scaling
         if self.with_scale:
-            weight = self.weight
-        else:
-            weight = mx.ones(x.shape[-1], dtype=x.dtype)
+            output = output * (self.weight + self.scale_shift)
 
-        scaled_weight = weight + self.scale_shift
-        output = normed * scaled_weight
-
-        return output
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.eps}"
-
+        return output.astype(x.dtype)
 
 class Gemma3nLaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
@@ -271,7 +268,7 @@ class MLP(nn.Module):
     def _gaussian_topk(self, inputs: mx.array) -> mx.array:
         # For normal distribution, icdf(p) = -sqrt(2) * erfinv(2p - 1)
         p = mx.array(self.activation_sparsity, dtype=mx.float32)
-        std_multiplier = mx.sqrt(2) * mx.erfinv(2 * p - 1)
+        std_multiplier = mx.sqrt(2.0) * mx.erfinv(2 * p - 1)
         std_multiplier = std_multiplier.astype(inputs.dtype)
         inputs_mean = mx.mean(inputs, axis=-1, keepdims=True)
         inputs_std = mx.std(inputs, axis=-1, keepdims=True)
@@ -965,20 +962,18 @@ class SlidingWindowCache(_BaseCache):
             self.offset += seq_len
         else:
             # Need to slide the window
-            # Shift existing content left
-            shift_amount = seq_len
-            if shift_amount < self.max_size:
+            if seq_len < self.max_size:
+                # Shift existing content left
+                shift_amount = min(seq_len, self.max_size - 1)
                 self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
-                self.values[:, :, :-shift_amount, :] = self.values[
-                    :, :, shift_amount:, :
-                ]
+                self.values[:, :, :-shift_amount, :] = self.values[:, :, shift_amount:, :]
                 # Add new tokens at the end
-                self.keys[:, :, -shift_amount:, :] = keys
-                self.values[:, :, -shift_amount:, :] = values
+                self.keys[:, :, -shift_amount:, :] = keys[:, :, -shift_amount:, :]
+                self.values[:, :, -shift_amount:, :] = values[:, :, -shift_amount:, :]
             else:
                 # New sequence is larger than cache, just keep the last max_size tokens
-                self.keys = keys[:, :, -self.max_size :, :]
-                self.values = values[:, :, -self.max_size :, :]
+                self.keys = keys[:, :, -self.max_size:, :]
+                self.values = values[:, :, -self.max_size:, :]
             self.offset = self.max_size
 
         return self.keys, self.values
@@ -1008,10 +1003,10 @@ class SlidingWindowCache(_BaseCache):
         self.max_size, self.step, self.offset = map(int, v)
 
     def is_trimmable(self):
-        return False  # Sliding window cache doesn't support trimming
+        return False
 
     def trim(self, n):
-        return 0  # No trimming for sliding window
+        return 0
 
 
 class StaticKVCache(_BaseCache):
@@ -1042,22 +1037,8 @@ class StaticKVCache(_BaseCache):
         actual_seq_len = end_pos - self.offset
 
         if actual_seq_len > 0:
-            self.keys = mx.concatenate(
-                [
-                    self.keys[:, :, : self.offset, :],
-                    keys[:, :, :actual_seq_len, :],
-                    self.keys[:, :, end_pos:, :],
-                ],
-                axis=2,
-            )
-            self.values = mx.concatenate(
-                [
-                    self.values[:, :, : self.offset, :],
-                    values[:, :, :actual_seq_len, :],
-                    self.values[:, :, end_pos:, :],
-                ],
-                axis=2,
-            )
+            self.keys[:, :, self.offset:end_pos, :] = keys[:, :, :actual_seq_len, :]
+            self.values[:, :, self.offset:end_pos, :] = values[:, :, :actual_seq_len, :]
             self.offset = end_pos
 
         return self.keys, self.values
@@ -1073,7 +1054,6 @@ class StaticKVCache(_BaseCache):
         if v is not None and len(v) == 2:
             self.keys, self.values = v
             if self.keys is not None:
-                # Calculate offset based on non-zero entries
                 self.offset = self.max_size
 
     @property

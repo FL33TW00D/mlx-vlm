@@ -292,7 +292,7 @@ class Gemma3nAudioAttention(nn.Module):
         q_scale = self.head_dim**-0.5
         # Fix: Implement softplus manually since nn.softplus doesn't exist in MLX
         # softplus(x) = log(1 + exp(x))
-        r_softplus_0 = 1.0 / mx.log1p(mx.exp(mx.array(0.0)))
+        r_softplus_0 = 1.0 / mx.log(2.0)
         self._q_scale = q_scale * r_softplus_0
 
         lower_causal_mask = mx.tril(
@@ -386,7 +386,7 @@ class Gemma3nAudioAttention(nn.Module):
         key_states = self.k_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
         value_states = self.v_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
 
-        per_dim_scale_sp = mx.log1p(mx.exp(self.per_dim_scale))
+        per_dim_scale_sp = mx.logaddexp(self.per_dim_scale, 0.0)
 
         broadcast_shape = (1, 1, 1, self.head_dim)
         per_dim_scale_sp_broadcast = per_dim_scale_sp.reshape(broadcast_shape)
@@ -462,7 +462,7 @@ class Gemma3nAudioAttention(nn.Module):
         # Apply the combined mask.
         # final_condition_for_where will broadcast with logits [B,N,U,W,C]
         logits = mx.where(final_condition_for_where, logits, self.attention_invalid_logits_value)
-        probabilities = mx.softmax(logits, precise=True, axis=-1).astype(value_blocks.dtype)
+        probabilities = mx.softmax(logits.astype(mx.float32), axis=-1).astype(value_blocks.dtype)
 
         # context_vectors is adapted from jax.numpy.einsum("BNuwc,BucNH->BuwNH", ...)
         b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
@@ -787,16 +787,16 @@ class Gemma3nAudioConformerAttention(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
         audio_encodings_input_to_attn = x
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
-        x = self.pre_attn_norm(x)
+        audio_encodings_norm = self.pre_attn_norm(x)
         # Output of self.attn is [B, T, NumHeads, HeadDim]
-        x = self.attn(x, mask)
+        audio_encodings_attn_out = self.attn(audio_encodings_norm, mask)
 
         # Reshape from [B, T, NumHeads, HeadDim] to [B, T, NumHeads * HeadDim]
         # NumHeads * HeadDim = hidden_size
-        b, t, num_heads, head_dim = x.shape
-        x = x.reshape(b, t, num_heads * head_dim)
+        b, t, num_heads, head_dim = audio_encodings_attn_out.shape
+        audio_encodings_reshaped = audio_encodings_attn_out.reshape(b, t, num_heads * head_dim)
 
-        x = self.post(x)
+        x = self.post(audio_encodings_reshaped)
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
         return audio_encodings_input_to_attn + self.post_norm(x)
 
@@ -818,9 +818,9 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         residual = x
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
         x = self.pre_layer_norm(x)
-        x = self.ffw_layer_1(x)  # jax.numpy.einsum("...a,ab->...b")
+        x: mx.array = self.ffw_layer_1(x)  # jax.numpy.einsum("...a,ab->...b")
         x = nn.silu(x)  # Add SiLU (Swish) activation
-        x = self.ffw_layer_2(x)  # jax.numpy.einsum("...a,ab->...b")
+        x: mx.array = self.ffw_layer_2(x)  # jax.numpy.einsum("...a,ab->...b")
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
         x = self.post_layer_norm(x)
         return residual + (x * self._post_layer_scale)
@@ -952,7 +952,7 @@ class AudioModel(nn.Module):
                 current_mask = current_mask[:, :t_sub]
             else:  # current_mask.shape[1] < t_sub
                 padding_needed = t_sub - current_mask.shape[1]
-                current_mask = mx.pad(current_mask, (0, padding_needed), mode="constant", constant_values=True)  # Pad with True (masked)
+                current_mask = mx.pad(current_mask, convert_torch_to_mlx_pad_width((0, padding_needed), current_mask.shape))
 
         for i, block in enumerate(self.conformer):
             audio_encodings = block(audio_encodings, current_mask)  # Pass the processed mask
@@ -970,7 +970,7 @@ class AudioModel(nn.Module):
             mask_current_len = current_mask.shape[1]
             if target_len > mask_current_len:
                 padding_needed = target_len - mask_current_len
-                current_mask = mx.pad(current_mask, (0, padding_needed), mode="constant", constant_values=True)
+                current_mask = mx.pad(current_mask, convert_torch_to_mlx_pad_width((0, padding_needed), current_mask.shape))
             elif mask_current_len > target_len:  # mask is longer
                 current_mask = current_mask[:, :target_len]
 
