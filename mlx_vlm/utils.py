@@ -139,7 +139,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None, force_d
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
-                    "*.jinja"
+                    "*.jinja",
                 ],
                 force_download=force_download,
             )
@@ -156,6 +156,8 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -296,6 +298,7 @@ def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
+    revision: Optional[str] = None,
     **kwargs,
 ) -> Tuple[nn.Module, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
     """
@@ -310,6 +313,8 @@ def load(
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
+        revision (str, optional): A revision id which can be a branch name,
+            a tag, or a commit hash. Default: ``None``.
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.
 
@@ -319,6 +324,7 @@ def load(
     """
     force_download = kwargs.get("force_download", False)
     model_path = get_model_path(path_or_hf_repo, force_download=force_download)
+
 
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
@@ -857,9 +863,7 @@ def process_inputs_with_fallback(processor, images, audio, prompts, return_tenso
             )
             inputs = process_inputs(processor, images=images, audio=audio, prompts=prompts, return_tensors="pt")
         except Exception as e:
-            raise ValueError(
-                f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
-            )
+            raise ValueError(f"Failed to process inputs with error: {e}")
     return inputs
 
 
@@ -1028,7 +1032,6 @@ def generate_step(
                     **kwargs,
                 )
             else:
-
                 outputs = model.language_model(
                     y[None],
                     cache=cache,
@@ -1110,7 +1113,7 @@ class StoppingCriteria:
                                If strings are provided, they will be converted to integers if possible.
         """
         if new_eos_token_ids is None:
-            pass
+            return
 
         if self.tokenizer is None:
             raise ValueError("Processor is not provided")
