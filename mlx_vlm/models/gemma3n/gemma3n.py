@@ -175,7 +175,13 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
-        sanitized_weights = {".".join(k.split(".")[1:]): v for k, v in weights.items() if "vision_tower" not in k and "embed_vision" not in k}
+        sanitized_weights = {}
+        for k, v in weights.items():
+            if "vision_tower" not in k and "embed_vision" not in k:
+                if k.startswith("model."):
+                    sanitized_weights[".".join(k.split(".")[1:])] = v
+                else:
+                    sanitized_weights[k] = v
         return sanitized_weights
 
     @staticmethod

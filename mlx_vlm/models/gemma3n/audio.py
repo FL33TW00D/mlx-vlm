@@ -9,8 +9,7 @@ import numpy as np
 
 from .language import Gemma3nRMSNorm
 from .config import AudioConfig, ModelConfig
-
-
+from ..base import check_array_shape
 
 def convert_torch_to_mlx_pad_width(padding, input_shape):
     """Convert PyTorch padding to MLX pad_width format"""
@@ -981,8 +980,14 @@ class AudioModel(nn.Module):
         sanitized_weights = {}
         for k, v in weights.items():
             if "conv.weight" in k:
-                v = v.transpose(0, 2, 3, 1)
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             if "conv1d.weight" in k:
-                v = v.transpose(0, 2, 1)
+                if check_array_shape(v):
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 1)
             sanitized_weights[k] = v
         return sanitized_weights

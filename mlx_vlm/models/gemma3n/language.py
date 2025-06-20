@@ -870,7 +870,7 @@ class LanguageModel(nn.Module):
         sanitized_weights = {}
 
         for k, v in weights.items():
-            if "language_model" in k:
+            if "language_model.model" not in k and "language_model.lm_head" not in k:
                 new_key = k.replace("language_model", "language_model.model")
                 sanitized_weights[new_key] = v
             elif "self_attn.rotary_emb.inv_freq" in k:
@@ -879,7 +879,7 @@ class LanguageModel(nn.Module):
                 sanitized_weights[k] = v
 
 
-        if "lm_head.weight" not in sanitized_weights:
+        if "language_model.lm_head.weight" not in sanitized_weights:
             embed_tokens_key = "language_model.model.embed_tokens.weight"
             if embed_tokens_key in sanitized_weights:
                 sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[embed_tokens_key]

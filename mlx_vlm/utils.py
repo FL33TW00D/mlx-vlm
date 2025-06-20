@@ -205,7 +205,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     skip_vision = vision_config.get("skip_vision", False)
 
     audio_config = config.get("audio_config", {})
-    skip_audio = audio_config.get("skip_audio", False)
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
