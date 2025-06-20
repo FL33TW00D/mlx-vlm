@@ -1147,7 +1147,7 @@ def stream_generate(
 
     add_special_tokens = (
         not hasattr(processor, "chat_template")
-        if model.config.model_type == "gemma3"
+        if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
     prompt_tokens = mx.array(
