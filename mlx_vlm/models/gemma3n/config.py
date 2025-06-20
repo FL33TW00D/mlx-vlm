@@ -22,7 +22,7 @@ class AudioConfig:
     sscp_conv_group_norm_eps: float = 1e-3
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
-    vocab_size: int = 262144
+    vocab_size: int = 128
     sscp_conv_eps: float = 1e-3
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
@@ -48,6 +48,7 @@ class VisionConfig:
     image_size: int = 224
     num_channels: int = 3
     layer_norm_eps: float = 1e-6
+    vocab_size: int = 128
 
     @classmethod
     def from_dict(cls, params):
@@ -73,6 +74,7 @@ class TextConfig:
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5
     altup_active_idx: int = 0
+    pad_token_id: int = 0
     altup_num_inputs: int = 4
     altup_coef_clip: Optional[float] = None
     altup_correct_scale: bool = True
@@ -116,6 +118,7 @@ class ModelConfig:
     image_token_id: int = 262145
     hidden_size: int = 2048
     pad_token_id: int = 0
+    audio_soft_tokens_per_image: int = 188
     eos_token_id: Optional[List[int]] = None
 
     @classmethod
