@@ -124,7 +124,7 @@ def main():
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
     num_images = len(args.image) if args.image is not None else 0
-    num_audios = len(args.audio) if args.audio is not None else 0
+    num_audios =  1 if args.audio is not None else 0 # TODO: Support multiple audio files
     prompt = apply_chat_template(processor, config, prompt, num_images=num_images, num_audios=num_audios)
 
     kwargs = {}
