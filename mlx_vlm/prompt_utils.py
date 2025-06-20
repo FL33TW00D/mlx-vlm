@@ -51,7 +51,7 @@ def get_message_json(
         if role == "user" and not skip_image_token:
             message["content"] = [{"type": "image"}] * num_images + message["content"]
         if role == "user" and not skip_audio_token:
-            message["content"] = [{"type": "audio"}] * num_audios + message["content"]
+            message["content"] = message["content"] + [{"type": "audio"}] * num_audios
         if role == "assistant":
             message["content"] = message["content"][0]["content"]
         return message

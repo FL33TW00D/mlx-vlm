@@ -15,6 +15,8 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import soundfile as sf
+import scipy.signal as signal
 import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
@@ -809,25 +811,43 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
-def process_inputs(processor, images, prompts, return_tensors="mlx"):
+def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    gcd = np.gcd(orig_sr, target_sr)
+    up = target_sr // gcd
+    down = orig_sr // gcd
+    resampled = signal.resample_poly(audio, up, down, padtype="edge")
+    return resampled
+
+
+def load_audio(
+    file: str,
+    sr: int,
+):
+    audio, sample_rate = sf.read(file, always_2d=True)
+    if sample_rate != sr:
+        audio = resample_audio(audio, sample_rate, sr)
+    return np.array(audio).mean(axis=1)
+
+def process_inputs(processor, images=None, audio=None, prompts=None, return_tensors="mlx"):
     if hasattr(processor, "process"):
         inputs = processor.process(
             text=prompts,
             images=images,
+            audio=audio,
             padding=True,
             return_tensors=return_tensors,
         )
     else:
         inputs = processor(
-            text=prompts, images=images, padding=True, return_tensors=return_tensors
+            text=prompts, images=images, audio=audio, padding=True, return_tensors=return_tensors
         )
     return inputs
 
 
-def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx"):
+def process_inputs_with_fallback(processor, images, audio, prompts, return_tensors="mlx"):
     try:
         inputs = process_inputs(
-            processor, images, prompts, return_tensors=return_tensors
+            processor, images=images, audio=audio, prompts=prompts, return_tensors=return_tensors
         )
     except Exception as e:
         try:
@@ -835,7 +855,7 @@ def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx
                 f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
                 "Trying to process inputs with return_tensors='pt'",
             )
-            inputs = process_inputs(processor, images, prompts, return_tensors="pt")
+            inputs = process_inputs(processor, images=images, audio=audio, prompts=prompts, return_tensors="pt")
         except Exception as e:
             raise ValueError(
                 f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
@@ -843,16 +863,24 @@ def process_inputs_with_fallback(processor, images, prompts, return_tensors="mlx
     return inputs
 
 
-def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=None):
-
-    if not isinstance(images, list):
-        images = [images]
-
+def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token_index=None, resize_shape=None):
     # Process images
-    image_processor = (
-        processor.image_processor if hasattr(processor, "image_processor") else None
-    )
-    images = [process_image(img, resize_shape, image_processor) for img in images]
+    if images is not None:
+        if not isinstance(images, list):
+            images = [images]
+
+        image_processor = (
+            processor.image_processor if hasattr(processor, "image_processor") else None
+        )
+        images = [process_image(img, resize_shape, image_processor) for img in images]
+
+    # Process audio
+    if audio is not None:
+        if not isinstance(audio, list):
+            audio = [audio]
+            print(f"{audio=}")
+        audio = [load_audio(audio_file, sr=processor.feature_extractor.sampling_rate) for audio_file in audio]
+
 
     model_inputs = {}
 
@@ -891,19 +919,12 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        inputs = process_inputs_with_fallback(processor, images, prompts)
+        inputs = process_inputs_with_fallback(processor, images=images, audio=audio, prompts=prompts)
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
-        if isinstance(inputs["pixel_values"], list):
-            pixel_values = inputs["pixel_values"]
-        else:
-            pixel_values = mx.array(inputs["pixel_values"])
-
-        model_inputs["input_ids"] = mx.array(inputs["input_ids"])
-        model_inputs["pixel_values"] = pixel_values
         model_inputs["attention_mask"] = (
             mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
         )
@@ -913,7 +934,6 @@ def prepare_inputs(processor, images, prompts, image_token_index, resize_shape=N
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
-
 
 def generate_step(
     input_ids: mx.array,
@@ -1120,6 +1140,7 @@ def stream_generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
+    audio:  Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -1157,27 +1178,23 @@ def stream_generate(
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    if kwargs.get("pixel_values") is None:
-        if not image:
-            input_ids = prompt_tokens[None, :]
-            pixel_values = mask = None
-        else:
-            inputs = prepare_inputs(
-                processor, image, prompt, image_token_index, resize_shape
-            )
-            input_ids = inputs["input_ids"]
-            pixel_values = inputs["pixel_values"]
-            mask = inputs["attention_mask"]
-            data_kwargs = {
-                k: v
-                for k, v in inputs.items()
-                if k not in ["input_ids", "pixel_values", "attention_mask"]
-            }
-            kwargs.update(data_kwargs)
-    else:
+    if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values")
-        mask = kwargs.pop("mask")
+        pixel_values = kwargs.pop("pixel_values", None)
+        mask = kwargs.pop("mask", None)
+    else:
+        inputs = prepare_inputs(
+            processor, images=image, audio=audio, prompts=prompt, image_token_index=image_token_index, resize_shape=resize_shape
+        )
+        input_ids = inputs.get("input_ids", None)
+        pixel_values = inputs.get("pixel_values", None)
+        mask = inputs.get("attention_mask", None)
+        data_kwargs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in ["input_ids", "pixel_values", "attention_mask"]
+        }
+        kwargs.update(data_kwargs)
 
     with wired_limit(model, [generation_stream]):
         detokenizer = processor.detokenizer
@@ -1230,6 +1247,7 @@ def generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> str:
@@ -1252,14 +1270,15 @@ def generate(
 
     if verbose:
         print("=" * 10)
+        files = []
         if image is not None:
-            input_path = image
-        elif kwargs.get("video") is not None:
-            input_path = kwargs.get("video")
-        else:
-            input_path = None
+            files.extend(image)
+        if audio is not None:
+            files.extend(audio)
+        if kwargs.get("video") is not None:
+            files.extend(kwargs.get("video"))
 
-        print(f"Files: {input_path}", "\n")
+        print(f"Files: {files}", "\n")
 
         print("Prompt:", prompt)
 
@@ -1289,7 +1308,7 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, **kwargs):
+    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text

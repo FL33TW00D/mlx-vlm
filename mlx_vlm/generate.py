@@ -12,8 +12,8 @@ from .utils import (
 )
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
-DEFAULT_IMAGE = []
-DEFAULT_AUDIO = []
+DEFAULT_IMAGE = None
+DEFAULT_AUDIO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.5
@@ -118,7 +118,9 @@ def main():
 
     prompt = codecs.decode(args.prompt, "unicode_escape")
 
-    prompt = apply_chat_template(processor, config, prompt, num_images=len(args.image), num_audios=len(args.audio))
+    num_images = len(args.image) if args.image is not None else 0
+    num_audios = len(args.audio) if args.audio is not None else 0
+    prompt = apply_chat_template(processor, config, prompt, num_images=num_images, num_audios=num_audios)
 
     kwargs = {}
 
@@ -155,6 +157,7 @@ def main():
                 processor,
                 prompt,
                 args.image,
+                args.audio,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 **kwargs,
@@ -171,6 +174,7 @@ def main():
             processor,
             prompt,
             image=args.image,
+            audio=args.audio,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
