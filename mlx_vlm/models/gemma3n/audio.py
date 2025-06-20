@@ -1099,10 +1099,12 @@ class AudioModel(nn.Module):
                     sanitized_weights[k] = v
                 else:
                     sanitized_weights[k] = v.transpose(0, 2, 3, 1)
-            if "conv1d.weight" in k:
+            elif "conv1d.weight" in k:
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:
                     sanitized_weights[k] = v.transpose(0, 2, 1)
-            sanitized_weights[k] = v
+            else:
+                sanitized_weights[k] = v
+
         return sanitized_weights
