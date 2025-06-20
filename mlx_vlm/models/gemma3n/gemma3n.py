@@ -6,14 +6,15 @@ from pathlib import Path
 from typing import List, Optional
 
 import mlx.core as mx
-import numpy as np
 import mlx.nn as nn
+import numpy as np
 from huggingface_hub import snapshot_download
 
 from .audio import AudioModel, Gemma3nAudioEmbedder
+from .config import ModelConfig
 from .language import LanguageModel, TextConfig
 from .vision import Gemma3p5VisionEmbedder, VisionConfig, VisionModel
-from .config import ModelConfig
+
 
 def masked_scatter(input_tensor, mask, source):
     """MLX implementation of PyTorch's masked_scatter - simplified version"""
@@ -41,12 +42,12 @@ def masked_scatter(input_tensor, mask, source):
 
     return result.reshape(mask.shape)
 
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
         self.config = config
-
 
         # Text
         self.language_model = LanguageModel(config.text_config)
@@ -56,7 +57,9 @@ class Model(nn.Module):
         # self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
 
         # # Audio
-        audio_vocab_offset = config.text_config.vocab_size + config.vision_config.vocab_size
+        audio_vocab_offset = (
+            config.text_config.vocab_size + config.vision_config.vocab_size
+        )
 
         self.audio_tower = AudioModel(config.audio_config)
         self.embed_audio = Gemma3nAudioEmbedder(config, vocab_offset=audio_vocab_offset)
@@ -88,25 +91,37 @@ class Model(nn.Module):
         inputs_embeds = self.embed(input_ids)
 
         if input_features is not None:
-            audio_outputs, audio_mask = self.get_audio_features(input_features, ~input_features_mask)
+            audio_outputs, audio_mask = self.get_audio_features(
+                input_features, ~input_features_mask
+            )
             padding_tok = mx.array([[self.config.text_config.pad_token_id]])
             padding_embs = self.embed_audio(input_ids=padding_tok)
 
             audio_outputs = mx.where(audio_mask[..., None], padding_embs, audio_outputs)
 
-            extra_padding_tokens = self.config.audio_soft_tokens_per_image - audio_outputs.shape[1]
+            extra_padding_tokens = (
+                self.config.audio_soft_tokens_per_image - audio_outputs.shape[1]
+            )
             extra_padding_features = mx.broadcast_to(
-                padding_embs, (audio_outputs.shape[0], extra_padding_tokens, padding_embs.shape[2])
+                padding_embs,
+                (audio_outputs.shape[0], extra_padding_tokens, padding_embs.shape[2]),
             )
 
-
-            audio_outputs = mx.concatenate((audio_outputs, extra_padding_features), axis=1)
+            audio_outputs = mx.concatenate(
+                (audio_outputs, extra_padding_features), axis=1
+            )
             return self.merge_multimodal_and_text(
-                input_ids, inputs_embeds, audio_outputs, self.config.audio_token_id, modality="audio"
+                input_ids,
+                inputs_embeds,
+                audio_outputs,
+                self.config.audio_token_id,
+                modality="audio",
             )
 
     def get_audio_features(self, input_features, input_features_mask):
-        audio_outputs, audio_mask = self.audio_tower(input_features, input_features_mask)
+        audio_outputs, audio_mask = self.audio_tower(
+            input_features, input_features_mask
+        )
         return self.embed_audio(inputs_embeds=audio_outputs), audio_mask
 
     def get_image_features(self, pixel_values):
@@ -124,7 +139,9 @@ class Model(nn.Module):
         vision_outputs *= self.config.vision_config.hidden_size**0.5
         return self.embed_vision(vision_outputs, is_soft_embedding=True)
 
-    def merge_multimodal_and_text(self, input_ids, inputs_embeds, features, token_id, modality="image"):
+    def merge_multimodal_and_text(
+        self, input_ids, inputs_embeds, features, token_id, modality="image"
+    ):
 
         if input_ids is None:
             special_modality_mask = inputs_embeds == self.embed_audio(
@@ -151,7 +168,6 @@ class Model(nn.Module):
         inputs_embeds = masked_scatter(inputs_embeds, special_modality_mask, features)
         return inputs_embeds
 
-
     def __call__(
         self,
         input_ids: mx.array,
@@ -164,7 +180,11 @@ class Model(nn.Module):
         input_features = kwargs.pop("input_features", None)
         input_features_mask = kwargs.pop("input_features_mask", None)
         inputs_embeds = self.get_input_embeddings(
-            input_ids=input_ids, pixel_values=pixel_values, input_features=input_features, input_features_mask=input_features_mask, **kwargs
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+            **kwargs,
         )
 
         logits = self.language_model(

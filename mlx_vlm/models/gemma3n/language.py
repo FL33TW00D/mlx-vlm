@@ -1,8 +1,8 @@
+import copy
 import inspect
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-import copy
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,7 +11,6 @@ from mlx_lm.models.cache import _BaseCache
 from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
 from ..cache import ChunkedKVCache, KVCache, RotatingKVCache
 from .config import TextConfig
-
 
 
 class Gemma3nRMSNorm(nn.Module):
@@ -45,6 +44,7 @@ class Gemma3nRMSNorm(nn.Module):
             output = output * (self.weight + self.scale_shift)
 
         return output.astype(x.dtype)
+
 
 class Gemma3nLaurelBlock(nn.Module):
     """Learned Augmented Residual Layer"""
@@ -145,18 +145,17 @@ class Gemma3nAttention(nn.Module):
         self.head_dim = head_dim = config.head_dim
         self.layer_idx = layer_idx
 
-        self.scale = config.query_rescale_scalar / config.query_pre_attn_scalar
+        self.scale = 1.0
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.qkv_norm = Gemma3nRMSNorm(
-            dim=config.head_dim,
-            eps=config.rms_norm_eps,
-            scale_shift=0.0,
-            with_scale=False,
+        self.q_norm = Gemma3nRMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3nRMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma3nRMSNorm(
+            dim=config.head_dim, eps=config.rms_norm_eps, with_scale=False
         )
 
         first_kv_shared_layer_idx = (
@@ -189,7 +188,7 @@ class Gemma3nAttention(nn.Module):
 
         queries = self.q_proj(x)
         queries = queries.reshape(hidden_shape)
-        queries = self.qkv_norm(queries)
+        queries = self.q_norm(queries)
         queries = apply_rotary_pos_emb(queries, cos, sin, unsqueeze_dim=2)
         queries = queries.transpose(0, 2, 1, 3)
 
@@ -206,12 +205,12 @@ class Gemma3nAttention(nn.Module):
 
         else:
             keys = self.k_proj(x).reshape(hidden_shape)
-            keys = self.qkv_norm(keys)
+            keys = self.k_norm(keys)
             keys = apply_rotary_pos_emb(keys, cos, sin, unsqueeze_dim=2)
             keys = keys.transpose(0, 2, 1, 3)
 
             values = self.v_proj(x).reshape(hidden_shape)
-            values = self.qkv_norm(values)
+            values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
             if cache is not None:
@@ -611,49 +610,44 @@ class Gemma3Model(nn.Module):
         and leaves allowed cells at 0 · 0.
         """
 
-        dtype  = input_tensor.dtype
-        batch  = input_tensor.shape[0]
-        q_len  = input_tensor.shape[1]           # sequence_length
+        dtype = input_tensor.dtype
+        batch = input_tensor.shape[0]
+        q_len = input_tensor.shape[1]  # sequence_length
 
         # -- determine how *wide* the mask must be ---------------------------
-        if (
-            past_key_values                                    # cache list exists
-            and isinstance(past_key_values[0], _BaseCache)     # our KV-cache class
-        ):
+        if past_key_values and isinstance(  # cache list exists
+            past_key_values[0], _BaseCache
+        ):  # our KV-cache class
             layer0 = past_key_values[0]
 
-            if layer0.keys is not None:                        # cache already filled
+            if layer0.keys is not None:  # cache already filled
                 k_len = int(layer0.keys.shape[2])
-            else:                                              # first forward pass
-                k_len = int(layer0.max_size)                   # use full capacity
+            else:  # first forward pass
+                k_len = int(layer0.max_size)  # use full capacity
 
-            k_len = max(k_len, q_len)                          # safety for pre-fill
+            k_len = max(k_len, q_len)  # safety for pre-fill
         else:
             k_len = (
-                int(attention_mask.shape[-1])
-                if attention_mask is not None
-                else q_len
+                int(attention_mask.shape[-1]) if attention_mask is not None else q_len
             )
 
         # -- build / return ---------------------------------------------------
         return self._prepare_4d_causal_attention_mask_with_cache_position(
             attention_mask,
-            sequence_length = q_len,
-            target_length   = k_len,
-            dtype           = dtype,
-            cache_position  = cache_position,
-            batch_size      = batch,
+            sequence_length=q_len,
+            target_length=k_len,
+            dtype=dtype,
+            cache_position=cache_position,
+            batch_size=batch,
         )
-
-
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: mx.array | None,   # (B ,K) or (B,1,Q,K) or None
-        sequence_length: int,              # Q
-        target_length:   int,              # K
+        attention_mask: mx.array | None,  # (B ,K) or (B,1,Q,K) or None
+        sequence_length: int,  # Q
+        target_length: int,  # K
         dtype,
-        cache_position: mx.array,          # (Q,)  – indices of current tokens
+        cache_position: mx.array,  # (Q,)  – indices of current tokens
         batch_size: int,
     ):
         """
@@ -669,7 +663,7 @@ class Gemma3Model(nn.Module):
         if attention_mask is not None and attention_mask.ndim == 4:
             return attention_mask.astype(dtype)
 
-        min_val = mx.finfo(dtype).min            # -∞  in chosen precision
+        min_val = mx.finfo(dtype).min  # -∞  in chosen precision
 
         # ------------------------------------------------------------------ #
         # 1. causal part  – start full of -∞ then zero-out lower-triangle
@@ -677,41 +671,38 @@ class Gemma3Model(nn.Module):
         causal = mx.full((sequence_length, target_length), min_val, dtype=dtype)
 
         if sequence_length != 1:
-            causal = mx.triu(causal, k=1)        # keep q≥k at 0.0
+            causal = mx.triu(causal, k=1)  # keep q≥k at 0.0
 
         # static-cache shift: forbid keys that have *not* been written yet
         # (i.e. k_index  >  cache_position[q])
-        causal *= (
-            mx.arange(target_length) > cache_position.reshape(-1, 1)
-        )
+        causal *= mx.arange(target_length) > cache_position.reshape(-1, 1)
 
         # shape → (1,1,Q,K) then broadcast batch
-        causal = mx.expand_dims(causal, 0)       # (1,Q,K)
-        causal = mx.expand_dims(causal, 0)       # (1,1,Q,K)
+        causal = mx.expand_dims(causal, 0)  # (1,Q,K)
+        causal = mx.expand_dims(causal, 0)  # (1,1,Q,K)
         causal = mx.repeat(causal, repeats=batch_size, axis=0).astype(dtype)
 
         # ------------------------------------------------------------------ #
         # 2. padding part  – turn “mask = 0” keys into -∞ inside the slice
         # ------------------------------------------------------------------ #
-        if attention_mask is not None:           # (B,K)
-            Kmask_len  = int(attention_mask.shape[-1])
-            key_pad    = attention_mask.astype(dtype)            # 1/0
-            key_pad    = mx.expand_dims(key_pad, 1)               # (B,1,K)
-            key_pad    = mx.expand_dims(key_pad, 2)               # (B,1,1,K)
+        if attention_mask is not None:  # (B,K)
+            Kmask_len = int(attention_mask.shape[-1])
+            key_pad = attention_mask.astype(dtype)  # 1/0
+            key_pad = mx.expand_dims(key_pad, 1)  # (B,1,K)
+            key_pad = mx.expand_dims(key_pad, 2)  # (B,1,1,K)
 
             # slice only the prefix that overlaps real keys
             causal_prefix = causal[:, :, :, :Kmask_len]
             causal_prefix = mx.where(
-                key_pad == 0,                        #==> padding key?
-                min_val,                             # ban
-                causal_prefix                        # keep previous (0 or –∞)
+                key_pad == 0,  # ==> padding key?
+                min_val,  # ban
+                causal_prefix,  # keep previous (0 or –∞)
             )
             causal = mx.concatenate(
                 [causal_prefix, causal[:, :, :, Kmask_len:]], axis=-1
             )
 
         return causal
-
 
     def __call__(
         self,
@@ -878,11 +869,12 @@ class LanguageModel(nn.Module):
             else:
                 sanitized_weights[k] = v
 
-
         if "language_model.lm_head.weight" not in sanitized_weights:
             embed_tokens_key = "language_model.model.embed_tokens.weight"
             if embed_tokens_key in sanitized_weights:
-                sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[embed_tokens_key]
+                sanitized_weights["language_model.lm_head.weight"] = sanitized_weights[
+                    embed_tokens_key
+                ]
 
         return sanitized_weights
 
@@ -966,14 +958,16 @@ class SlidingWindowCache(_BaseCache):
                 # Shift existing content left
                 shift_amount = min(seq_len, self.max_size - 1)
                 self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
-                self.values[:, :, :-shift_amount, :] = self.values[:, :, shift_amount:, :]
+                self.values[:, :, :-shift_amount, :] = self.values[
+                    :, :, shift_amount:, :
+                ]
                 # Add new tokens at the end
                 self.keys[:, :, -shift_amount:, :] = keys[:, :, -shift_amount:, :]
                 self.values[:, :, -shift_amount:, :] = values[:, :, -shift_amount:, :]
             else:
                 # New sequence is larger than cache, just keep the last max_size tokens
-                self.keys = keys[:, :, -self.max_size:, :]
-                self.values = values[:, :, -self.max_size:, :]
+                self.keys = keys[:, :, -self.max_size :, :]
+                self.values = values[:, :, -self.max_size :, :]
             self.offset = self.max_size
 
         return self.keys, self.values
@@ -1037,8 +1031,10 @@ class StaticKVCache(_BaseCache):
         actual_seq_len = end_pos - self.offset
 
         if actual_seq_len > 0:
-            self.keys[:, :, self.offset:end_pos, :] = keys[:, :, :actual_seq_len, :]
-            self.values[:, :, self.offset:end_pos, :] = values[:, :, :actual_seq_len, :]
+            self.keys[:, :, self.offset : end_pos, :] = keys[:, :, :actual_seq_len, :]
+            self.values[:, :, self.offset : end_pos, :] = values[
+                :, :, :actual_seq_len, :
+            ]
             self.offset = end_pos
 
         return self.keys, self.values

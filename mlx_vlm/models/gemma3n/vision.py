@@ -6,9 +6,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .language import Gemma3nRMSNorm
-from .config import VisionConfig
 from ..base import check_array_shape
+from .config import VisionConfig
+from .language import Gemma3nRMSNorm
 
 
 class Gemma3p5VisionEmbedder(nn.Module):
@@ -234,7 +234,6 @@ class VisionModel(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         self.model_type = config.model_type
-
 
         self.vision_model = SigLipVisionModel(config)
 

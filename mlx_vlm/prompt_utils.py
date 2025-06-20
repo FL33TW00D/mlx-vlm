@@ -2,7 +2,14 @@ from functools import partial
 
 
 def get_message_json(
-    model_name, prompt, role="user", skip_image_token=False, skip_audio_token=False, num_images=1, num_audios=1, **kwargs
+    model_name,
+    prompt,
+    role="user",
+    skip_image_token=False,
+    skip_audio_token=False,
+    num_images=1,
+    num_audios=1,
+    **kwargs,
 ):
     """
     Get the appropriate JSON message based on the specified model.
@@ -27,8 +34,10 @@ def get_message_json(
         return {"type": "text", "content": text}
 
     def create_message(message_type, content):
-        if message_type == "content": return create_text_content_message(content)
-        else: return create_text_message(content)
+        if message_type == "content":
+            return create_text_content_message(content)
+        else:
+            return create_text_message(content)
 
     def create_video_message(video_path, max_pixels=224 * 224, fps=1):
         return {
@@ -89,7 +98,9 @@ def get_message_json(
             handle_list_with_image, image_first=True
         ),
         "message_list_with_image_type": handle_list_with_image_type,
-        "message_list_with_image_type_text": lambda: handle_list_with_image_type(message_type="text"),
+        "message_list_with_image_type_text": lambda: handle_list_with_image_type(
+            message_type="text"
+        ),
         "message_with_image_token": lambda: handle_image_token("<image>"),
         "message_with_image_token_pipe": lambda: handle_image_token("<|image|>"),
         "message_with_start_image_token": lambda: handle_image_token(

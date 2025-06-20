@@ -1,15 +1,16 @@
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Tuple, Union, Optional
+from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .language import Gemma3nRMSNorm
-from .config import AudioConfig, ModelConfig
 from ..base import check_array_shape
+from .config import AudioConfig, ModelConfig
+from .language import Gemma3nRMSNorm
+
 
 def convert_torch_to_mlx_pad_width(padding, input_shape):
     """Convert PyTorch padding to MLX pad_width format"""
@@ -38,6 +39,7 @@ def convert_torch_to_mlx_pad_width(padding, input_shape):
         pad_width[-4] = (padding[6], padding[7])
 
     return pad_width
+
 
 class Gemma3nAudioEmbedder(nn.Module):
     """Embeds token ids or soft tokens into language model space."""
@@ -87,9 +89,10 @@ class Gemma3nAudioEmbedder(nn.Module):
         self, input_ids: mx.array = None, inputs_embeds: mx.array = None
     ) -> mx.array:
 
-
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds"
+            )
 
         if inputs_embeds is not None:
             emb_norm = self.soft_embedding_norm(inputs_embeds)
@@ -97,7 +100,9 @@ class Gemma3nAudioEmbedder(nn.Module):
             out_of_vocab_id = self.audio_config.vocab_size - 1
             input_ids = input_ids - self.vocab_offset
             input_ids = mx.where(input_ids < 0, out_of_vocab_id, input_ids)
-            input_ids = mx.where(input_ids >= self.audio_config.vocab_size, out_of_vocab_id, input_ids)
+            input_ids = mx.where(
+                input_ids >= self.audio_config.vocab_size, out_of_vocab_id, input_ids
+            )
             hard_emb = self.embedding(input_ids)
             emb_norm = self.hard_embedding_norm(hard_emb)
 
@@ -115,7 +120,9 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         self.channels = self.config.hidden_size
         self.head_dim = self.channels // self.num_heads
         self.max_backward = (
-            self.config.conf_attention_context_left - 1 if self.config.conf_attention_context_left > 0 else 0
+            self.config.conf_attention_context_left - 1
+            if self.config.conf_attention_context_left > 0
+            else 0
         )
         self.max_forward = self.config.conf_attention_context_right
 
@@ -126,22 +133,23 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         min_timescale = 1.0
         max_timescale = 1.0e4
         num_timescales = self.channels // 2
-        log_timescale_increment = math.log(float(max_timescale) / float(min_timescale)) / max(num_timescales - 1, 1)
-        inv_timescales = min_timescale * mx.exp(mx.arange(num_timescales) * -log_timescale_increment)
+        log_timescale_increment = math.log(
+            float(max_timescale) / float(min_timescale)
+        ) / max(num_timescales - 1, 1)
+        inv_timescales = min_timescale * mx.exp(
+            mx.arange(num_timescales) * -log_timescale_increment
+        )
 
-        self._inv_timescales = mx.array(
-            inv_timescales
-        )[None, None, ...]
+        self._inv_timescales = mx.array(inv_timescales)[None, None, ...]
 
-
-    def _get_timing_signal_1d_pos(
-        self, position: mx.array, dtype
-    ) -> mx.array:
+    def _get_timing_signal_1d_pos(self, position: mx.array, dtype) -> mx.array:
         assert position.ndim == 2
         position = mx.expand_dims(position.astype(mx.float32), axis=-1)
 
         scaled_time = position * self._inv_timescales
-        timing_signal = mx.concatenate([mx.sin(scaled_time), mx.cos(scaled_time)], axis=-1)
+        timing_signal = mx.concatenate(
+            [mx.sin(scaled_time), mx.cos(scaled_time)], axis=-1
+        )
         return timing_signal.astype(dtype)
 
     def _relative_shift(
@@ -159,7 +167,10 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         # We only pad the last dimension on the right.
         padding_tuple = (0, pad_amount_last_dim)
 
-        term_bd_padded = mx.pad(term_bd_before_shift, convert_torch_to_mlx_pad_width(padding_tuple, term_bd_before_shift.shape))
+        term_bd_padded = mx.pad(
+            term_bd_before_shift,
+            convert_torch_to_mlx_pad_width(padding_tuple, term_bd_before_shift.shape),
+        )
         # Shape after pad: [B, N, U, W, C+1]
         # Reshape for slicing (emulating JAX's behavior)
         # [B, N, U, W * (C+1)]
@@ -173,7 +184,9 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         )
 
         # Slice to effective [B, N, U, W * C]
-        term_bd_sliced = term_bd_reshaped[:, :, :, : query_block_size * key_context_size]
+        term_bd_sliced = term_bd_reshaped[
+            :, :, :, : query_block_size * key_context_size
+        ]
 
         # Reshape back to [B, N, U, W, C]
         term_bd_shifted = term_bd_sliced.reshape(
@@ -187,19 +200,22 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         )
         return term_bd_shifted
 
-
     def __call__(self, queries: mx.array, keys: mx.array) -> mx.array:
         # queries: [B, U, W, N, H] (batch, num_query_blocks, query_block_size, num_heads, head_dim)
         # keys:    [B, U, C, N, H] (batch, num_query_blocks, key_context_size, num_heads, head_dim)
         # C = W + L + R (key_context_size)
         # F_span = L + R + 1 (max_span + 1)
 
-        batch_size, num_query_blocks, query_block_size, num_heads, head_dim = queries.shape
+        batch_size, num_query_blocks, query_block_size, num_heads, head_dim = (
+            queries.shape
+        )
         _, _, key_context_size, _, _ = keys.shape
 
         # Relative positions for sinusoidal embeddings: [L, L-1, ..., -R]
         # Length is L+R+1 = self.max_span + 1
-        pos_indices = mx.expand_dims(mx.arange(self.max_backward, -self.max_forward - 1, -1), axis=0)  # Shape [1, F_span]
+        pos_indices = mx.expand_dims(
+            mx.arange(self.max_backward, -self.max_forward - 1, -1), axis=0
+        )  # Shape [1, F_span]
 
         max_span_plus_1 = pos_indices.shape[1]  # F_span
 
@@ -210,7 +226,9 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         # Project sinusoidal embeddings: [1, F_span, self.channels] -> [1, F_span, N*H]
         projected_sin_emb = self.pos_proj(sin_emb_timing_signal)
         # Reshape to [1, F_span, N, H] then squeeze to [F_span, N, H]
-        sin_emb = projected_sin_emb.reshape(1, max_span_plus_1, self.num_heads, self.head_dim).squeeze(
+        sin_emb = projected_sin_emb.reshape(
+            1, max_span_plus_1, self.num_heads, self.head_dim
+        ).squeeze(
             0
         )  # Shape [F, N, H]
 
@@ -235,7 +253,9 @@ class Gemma3nAudioRelativePositionEmbedding(nn.Module):
         s_transposed = sin_emb.transpose(1, 2, 0)  # Shape: [N, H, F]
 
         # Reshape queries for matmul: [B, N, U*W, H]
-        q_reshaped = q_transposed.reshape(batch_size, num_heads, num_query_blocks * query_block_size, head_dim)
+        q_reshaped = q_transposed.reshape(
+            batch_size, num_heads, num_query_blocks * query_block_size, head_dim
+        )
 
         # Perform matmul: [B, N, U*W, H] @ [N, H, F]
         # s_permuted ([N, H, F]) will be broadcast to [B, N, H, F]
@@ -277,16 +297,26 @@ class Gemma3nAudioAttention(nn.Module):
         self.chunk_size = self.config.conf_attention_chunk_size
         self.max_future_horizon = self.config.conf_attention_context_right
         self.max_past_horizon = max(0, self.config.conf_attention_context_left - 1)
-        self.attention_invalid_logits_value = self.config.conf_attention_invalid_logits_value
+        self.attention_invalid_logits_value = (
+            self.config.conf_attention_invalid_logits_value
+        )
         self.attention_logits_soft_cap = self.config.conf_attention_logit_cap
-        self.context_size = self.chunk_size + self.max_past_horizon + self.max_future_horizon
+        self.context_size = (
+            self.chunk_size + self.max_past_horizon + self.max_future_horizon
+        )
 
         self.relative_position_embedding = Gemma3nAudioRelativePositionEmbedding(config)
         self.per_dim_scale = mx.zeros((self.head_dim,))
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=False
+        )
 
         q_scale = self.head_dim**-0.5
         # Fix: Implement softplus manually since nn.softplus doesn't exist in MLX
@@ -302,8 +332,12 @@ class Gemma3nAudioAttention(nn.Module):
             mx.ones((self.chunk_size, self.context_size), dtype=mx.bool_),
             k=self.max_past_horizon + self.max_future_horizon,
         )
-        local_causal_valid_mask = mx.ones((self.chunk_size, self.context_size), dtype=mx.bool_)
-        local_causal_valid_mask = local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        local_causal_valid_mask = mx.ones(
+            (self.chunk_size, self.context_size), dtype=mx.bool_
+        )
+        local_causal_valid_mask = (
+            local_causal_valid_mask * lower_causal_mask * upper_causal_mask
+        )
         self._local_causal_valid_mask = local_causal_valid_mask
 
         self._softcap = mx.array(self.attention_logits_soft_cap, dtype=mx.float32)
@@ -356,9 +390,7 @@ class Gemma3nAudioAttention(nn.Module):
         # Stack along a new dimension
         return mx.stack(windows, axis=dimension + 1)
 
-    def _extract_block_context(
-        self, x: mx.array
-    ) -> mx.array:
+    def _extract_block_context(self, x: mx.array) -> mx.array:
         pad_left = self.max_past_horizon
 
         pad_right = self.max_future_horizon + self.chunk_size - 1
@@ -379,11 +411,16 @@ class Gemma3nAudioAttention(nn.Module):
 
         return x_unfolded
 
-
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
-        query_states = self.q_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
-        key_states = self.k_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
-        value_states = self.v_proj(x).reshape(*x.shape[:-1], self.num_heads, self.head_dim)
+        query_states = self.q_proj(x).reshape(
+            *x.shape[:-1], self.num_heads, self.head_dim
+        )
+        key_states = self.k_proj(x).reshape(
+            *x.shape[:-1], self.num_heads, self.head_dim
+        )
+        value_states = self.v_proj(x).reshape(
+            *x.shape[:-1], self.num_heads, self.head_dim
+        )
 
         per_dim_scale_sp = mx.logaddexp(self.per_dim_scale, 0.0)
 
@@ -402,7 +439,9 @@ class Gemma3nAudioAttention(nn.Module):
         original_valid_mask = ~mask  # True for valid, False for padded
 
         # 2. Extract blocks from this validity mask.
-        extracted_valid_mask_blocks = self._extract_block_context(original_valid_mask).transpose(0, 2, 1)
+        extracted_valid_mask_blocks = self._extract_block_context(
+            original_valid_mask
+        ).transpose(0, 2, 1)
 
         # If subframe_factor was used in _extract_block_context for a [B, T] input mask,
         # the shape might be [B, U, C/SF, SF]. Reshape to [B, U, C].
@@ -412,7 +451,9 @@ class Gemma3nAudioAttention(nn.Module):
             extracted_valid_mask_blocks.ndim == 4
             and extracted_valid_mask_blocks.shape[0] == batch_size
             and extracted_valid_mask_blocks.shape[1] == num_query_blocks
-            and extracted_valid_mask_blocks.shape[2] * extracted_valid_mask_blocks.shape[3] == self.context_size
+            and extracted_valid_mask_blocks.shape[2]
+            * extracted_valid_mask_blocks.shape[3]
+            == self.context_size
         ):
             extracted_valid_mask_blocks = extracted_valid_mask_blocks.reshape(
                 batch_size, num_query_blocks, self.context_size
@@ -434,8 +475,12 @@ class Gemma3nAudioAttention(nn.Module):
         # 3. Expand dimensions for broadcasting with logits and causal mask.
         # Target shape for broadcasting with logits [B,N,U,W,C]
         # extracted_valid_mask_blocks to [B, 1, U, 1, C]
-        condition_from_input_validity = mx.expand_dims(extracted_valid_mask_blocks, axis=1)
-        condition_from_input_validity = mx.expand_dims(condition_from_input_validity, axis=-2)
+        condition_from_input_validity = mx.expand_dims(
+            extracted_valid_mask_blocks, axis=1
+        )
+        condition_from_input_validity = mx.expand_dims(
+            condition_from_input_validity, axis=-2
+        )
 
         # self.local_causal_valid_mask is [W, C], True where allowed by local window.
         # Expand to [1, 1, 1, W, C]
@@ -460,8 +505,12 @@ class Gemma3nAudioAttention(nn.Module):
 
         # Apply the combined mask.
         # final_condition_for_where will broadcast with logits [B,N,U,W,C]
-        logits = mx.where(final_condition_for_where, logits, self.attention_invalid_logits_value)
-        probabilities = mx.softmax(logits.astype(mx.float32), axis=-1).astype(value_blocks.dtype)
+        logits = mx.where(
+            final_condition_for_where, logits, self.attention_invalid_logits_value
+        )
+        probabilities = mx.softmax(logits.astype(mx.float32), axis=-1).astype(
+            value_blocks.dtype
+        )
 
         # context_vectors is adapted from jax.numpy.einsum("BNuwc,BucNH->BuwNH", ...)
         b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
@@ -469,7 +518,9 @@ class Gemma3nAudioAttention(nn.Module):
         prob_bun = probabilities.transpose(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
         v_bun = value_blocks.transpose(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
         result_bmm = mx.matmul(prob_bun, v_bun)
-        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).transpose(0, 1, 3, 2, 4)
+        context_vectors = result_bmm.reshape(
+            b_dim, u_dim, n_dim, w_dim, h_dim
+        ).transpose(0, 1, 3, 2, 4)
         context_vectors = context_vectors.reshape(
             (
                 batch_size,
@@ -481,7 +532,6 @@ class Gemma3nAudioAttention(nn.Module):
         context_vectors = context_vectors[:, :q_time]
 
         return context_vectors
-
 
 
 class Gemma3nCumulativeGroupNorm(nn.Module):
@@ -504,7 +554,9 @@ class Gemma3nCumulativeGroupNorm(nn.Module):
     def __init__(
         self,
         num_channels: int,  # Number of channels (size of the last dimension)
-        feature_dims: Tuple[int],  # Sizes of non-channel feature dimensions, e.g., (H, W) for input [B,T,H,W,C]
+        feature_dims: Tuple[
+            int
+        ],  # Sizes of non-channel feature dimensions, e.g., (H, W) for input [B,T,H,W,C]
         eps: float = 1e-3,
         use_scale: bool = True,
         use_bias: bool = False,
@@ -552,7 +604,9 @@ class Gemma3nCumulativeGroupNorm(nn.Module):
 
         if mask is not None:
             if mask.shape != x.shape[:2]:
-                raise ValueError(f"Mask shape {mask.shape} must match input Batch/Time dimensions {x.shape[:2]}")
+                raise ValueError(
+                    f"Mask shape {mask.shape} must match input Batch/Time dimensions {x.shape[:2]}"
+                )
             if mask.dtype != mx.bool:
                 raise TypeError("Mask must be a boolean tensor.")
 
@@ -576,13 +630,17 @@ class Gemma3nCumulativeGroupNorm(nn.Module):
 
         # Cumulative Statistics Calculation
         # 1. Sum of values over reduction axes at each time step.
-        sum_values_at_t = mx.sum(x_masked_for_sum, axis=self.reduction_axes, keepdims=True)
+        sum_values_at_t = mx.sum(
+            x_masked_for_sum, axis=self.reduction_axes, keepdims=True
+        )
         # 2. Cumulative sum of values over time.
         cum_sum_values = mx.cumsum(sum_values_at_t, axis=1)
 
         # 3. Count of valid elements in the normalization group at each time step.
         #    (A "group" here consists of all features at a given Batch, Time).
-        elements_in_group_at_t = mx.sum(mask_calc, axis=self.reduction_axes, keepdims=True)
+        elements_in_group_at_t = mx.sum(
+            mask_calc, axis=self.reduction_axes, keepdims=True
+        )
         # 4. Cumulative count of valid elements over time.
         cum_count_elements = mx.cumsum(elements_in_group_at_t, axis=1)
         # Avoid division by zero if all preceding elements were masked.
@@ -630,9 +688,16 @@ class Gemma3nCumulativeGroupNorm(nn.Module):
         return final_output.astype(input_dtype)
 
 
-
 class Gemma3nAudioSSCPConvBlock(nn.Module):
-    def __init__(self, idx: int, input_freq_dim: int, config: AudioConfig,  manual_padding: Tuple[int, int, int, int] = (0, 0, 0, 0), *args, **kwargs):
+    def __init__(
+        self,
+        idx: int,
+        input_freq_dim: int,
+        config: AudioConfig,
+        manual_padding: Tuple[int, int, int, int] = (0, 0, 0, 0),
+        *args,
+        **kwargs,
+    ):
         super().__init__()
         self.config = config
         self.manual_padding = manual_padding
@@ -678,7 +743,9 @@ class Gemma3nAudioSSCPConvBlock(nn.Module):
         # manual_padding is (pad_F_left, pad_F_right, pad_T_top, pad_T_bottom)
         # F.pad applies to last two dims: F_in then T_in
 
-        audio_encodings_padded = mx.pad(x, convert_torch_to_mlx_pad_width(self.manual_padding, x.shape))
+        audio_encodings_padded = mx.pad(
+            x, convert_torch_to_mlx_pad_width(self.manual_padding, x.shape)
+        )
 
         # Expected padded shape for F_in, k_w=3, pad_F=(1,1) -> F_padded = F_in+2
         # Expected padded shape for T_in, k_h=3, pad_T=(0,2) -> T_padded = T_in+2
@@ -697,7 +764,9 @@ class Gemma3nAudioSubSampleConvProjection(nn.Module):
         super().__init__()
         self.config = config
 
-        current_f_for_block_input = config.input_feat_size  # Start with original feature dim
+        current_f_for_block_input = (
+            config.input_feat_size
+        )  # Start with original feature dim
         calculated_block_padding = []
         calculated_f_out_dims = []  # Tracking frequency dimension output sizes
 
@@ -731,7 +800,9 @@ class Gemma3nAudioSubSampleConvProjection(nn.Module):
             # Calculate output frequency dimension after this convolution
             # This uses the actual padding applied and kernel/stride.
             f_in_padded = current_f_for_block_input + pad_f_left + pad_f_right
-            f_out_after_conv = (f_in_padded - kernel_w) // stride_w + 1  # Assuming dilation_w = 1
+            f_out_after_conv = (
+                f_in_padded - kernel_w
+            ) // stride_w + 1  # Assuming dilation_w = 1
             calculated_f_out_dims.append(f_out_after_conv)
             current_f_for_block_input = f_out_after_conv
 
@@ -750,7 +821,9 @@ class Gemma3nAudioSubSampleConvProjection(nn.Module):
         final_c_out = config.sscp_conv_channel_size[-1]
         final_f_out = calculated_f_out_dims[-1]  # Final frequency dimension
         self.input_proj_in_features = final_c_out * final_f_out
-        self.input_proj_linear = nn.Linear(self.input_proj_in_features, self.config.hidden_size, bias=False)
+        self.input_proj_linear = nn.Linear(
+            self.input_proj_in_features, self.config.hidden_size, bias=False
+        )
 
     def __call__(self, x: mx.array) -> mx.array:
         # audio_encodings is [B, T, F_in]
@@ -780,7 +853,9 @@ class Gemma3nAudioConformerAttention(nn.Module):
 
         self.pre_attn_norm = Gemma3nRMSNorm(self.config.hidden_size)
         self.attn = Gemma3nAudioAttention(config)
-        self.post = nn.Linear(self.post_in_features, self.config.hidden_size, bias=False)
+        self.post = nn.Linear(
+            self.post_in_features, self.config.hidden_size, bias=False
+        )
         self.post_norm = Gemma3nRMSNorm(self.config.hidden_size)
 
     def __call__(self, x: mx.array, mask: mx.array) -> mx.array:
@@ -793,7 +868,9 @@ class Gemma3nAudioConformerAttention(nn.Module):
         # Reshape from [B, T, NumHeads, HeadDim] to [B, T, NumHeads * HeadDim]
         # NumHeads * HeadDim = hidden_size
         b, t, num_heads, head_dim = audio_encodings_attn_out.shape
-        audio_encodings_reshaped = audio_encodings_attn_out.reshape(b, t, num_heads * head_dim)
+        audio_encodings_reshaped = audio_encodings_attn_out.reshape(
+            b, t, num_heads * head_dim
+        )
 
         x = self.post(audio_encodings_reshaped)
         x = mx.clip(x, -self._gradient_clipping, self._gradient_clipping)
@@ -808,8 +885,12 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         self._gradient_clipping = mx.array(self.config.gradient_clipping)
 
         self.pre_layer_norm = Gemma3nRMSNorm(self.config.hidden_size)
-        self.ffw_layer_1 = nn.Linear(self.config.hidden_size, self.config.hidden_size * 4, bias=False)
-        self.ffw_layer_2 = nn.Linear(self.config.hidden_size * 4, self.config.hidden_size, bias=False)
+        self.ffw_layer_1 = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size * 4, bias=False
+        )
+        self.ffw_layer_2 = nn.Linear(
+            self.config.hidden_size * 4, self.config.hidden_size, bias=False
+        )
         self.post_layer_norm = Gemma3nRMSNorm(self.config.hidden_size)
         self._post_layer_scale = mx.array(self.config.conf_residual_weight)
 
@@ -825,15 +906,17 @@ class Gemma3nAudioConformerFeedForward(nn.Module):
         return residual + (x * self._post_layer_scale)
 
 
-
-
 class Gemma3nAudioConformerLightConv1d(nn.Module):
     def __init__(self, config: AudioConfig, *args, **kwargs):
         super().__init__()
         self.config = config
 
-        self.pre_layer_norm = Gemma3nRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.linear_start = nn.Linear(self.config.hidden_size, self.config.hidden_size * 2, bias=False)
+        self.pre_layer_norm = Gemma3nRMSNorm(
+            self.config.hidden_size, eps=self.config.rms_norm_eps
+        )
+        self.linear_start = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size * 2, bias=False
+        )
         self.depthwise_conv1d = nn.Conv1d(
             in_channels=self.config.hidden_size,
             out_channels=self.config.hidden_size,
@@ -844,11 +927,14 @@ class Gemma3nAudioConformerLightConv1d(nn.Module):
             bias=False,
         )
         self._gradient_clipping = mx.array(self.config.gradient_clipping)
-        self.conv_norm = Gemma3nRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        self.linear_end = nn.Linear(self.config.hidden_size, self.config.hidden_size, bias=False)
+        self.conv_norm = Gemma3nRMSNorm(
+            self.config.hidden_size, eps=self.config.rms_norm_eps
+        )
+        self.linear_end = nn.Linear(
+            self.config.hidden_size, self.config.hidden_size, bias=False
+        )
 
         self.causal_padding = self.config.conf_conv_kernel_size - 1
-
 
     def __call__(self, audio_encodings: mx.array) -> mx.array:
         audio_encodings_residual = audio_encodings  # Save for residual connection
@@ -859,15 +945,23 @@ class Gemma3nAudioConformerLightConv1d(nn.Module):
         # Permute for Conv1d: [B, T, D] -> [B, D, T]
         audio_encodings_transposed = audio_encodings.transpose(0, 2, 1)
         # Apply manual causal padding
-        audio_encodings_transposed_padded = mx.pad(audio_encodings_transposed, convert_torch_to_mlx_pad_width((self.causal_padding, 0), audio_encodings_transposed.shape))
-        audio_encodings = self.depthwise_conv1d(audio_encodings_transposed_padded.transpose(0, 2, 1))
-        audio_encodings = mx.clip(audio_encodings, -self._gradient_clipping, self._gradient_clipping)
+        audio_encodings_transposed_padded = mx.pad(
+            audio_encodings_transposed,
+            convert_torch_to_mlx_pad_width(
+                (self.causal_padding, 0), audio_encodings_transposed.shape
+            ),
+        )
+        audio_encodings = self.depthwise_conv1d(
+            audio_encodings_transposed_padded.transpose(0, 2, 1)
+        )
+        audio_encodings = mx.clip(
+            audio_encodings, -self._gradient_clipping, self._gradient_clipping
+        )
         audio_encodings = self.conv_norm(audio_encodings)
         audio_encodings = nn.silu(audio_encodings)
         audio_encodings = self.linear_end(audio_encodings)
         output = audio_encodings + audio_encodings_residual
         return output
-
 
 
 class Gemma3nAudioConformerBlock(nn.Module):
@@ -887,13 +981,15 @@ class Gemma3nAudioConformerBlock(nn.Module):
         audio_encodings = self.ffw_layer_start(audio_encodings)
         audio_encodings = self.attention(audio_encodings, audio_mel_mask)
         validity_mask_for_lconv = ~audio_mel_mask  # True for valid
-        audio_encodings_for_lconv_input = audio_encodings * mx.expand_dims(validity_mask_for_lconv, -1).astype(
-            audio_encodings.dtype
-        )
+        audio_encodings_for_lconv_input = audio_encodings * mx.expand_dims(
+            validity_mask_for_lconv, -1
+        ).astype(audio_encodings.dtype)
         audio_encodings = self.lconv1d(audio_encodings_for_lconv_input)
 
         audio_encodings = self.ffw_layer_end(audio_encodings)
-        audio_encodings = mx.clip(audio_encodings, -self._gradient_clipping, self._gradient_clipping)
+        audio_encodings = mx.clip(
+            audio_encodings, -self._gradient_clipping, self._gradient_clipping
+        )
         output = self.norm(audio_encodings)
         return output
 
@@ -909,8 +1005,12 @@ class AudioModel(nn.Module):
             for _ in range(config.conf_num_hidden_layers)
         ]
 
-    def __call__(self, audio_mel: mx.array, audio_mel_mask: mx.array) -> Tuple[mx.array, mx.array]:
-        audio_encodings = self.subsample_conv_projection(audio_mel)  # audio_encodings: [B, T_sub, D]
+    def __call__(
+        self, audio_mel: mx.array, audio_mel_mask: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        audio_encodings = self.subsample_conv_projection(
+            audio_mel
+        )  # audio_encodings: [B, T_sub, D]
 
         # Subsample the input audio_mel_mask to match the time dimension of audio_encodings (T_sub)
         t_sub = audio_encodings.shape[1]
@@ -923,12 +1023,16 @@ class AudioModel(nn.Module):
         # These indices map to original time steps corresponding to the start of each
         # receptive field in the subsampled output.
         indices = mx.arange(t_sub) * time_stride_product
-        indices = mx.clip(indices, None, a_max=audio_mel_mask.shape[1] - 1)  # Ensure indices are valid
+        indices = mx.clip(
+            indices, None, a_max=audio_mel_mask.shape[1] - 1
+        )  # Ensure indices are valid
 
         # Expand indices for batch compatibility if B > 1 and indices is 1D.
         if audio_mel_mask.ndim > 1 and indices.ndim == 1:
             indices = indices[None, :]
-            indices = mx.broadcast_to(indices, (audio_mel_mask.shape[0], indices.shape[1]))  # [B, T_sub]
+            indices = mx.broadcast_to(
+                indices, (audio_mel_mask.shape[0], indices.shape[1])
+            )  # [B, T_sub]
         elif (
             audio_mel_mask.ndim == indices.ndim
             and audio_mel_mask.shape[0] == 1
@@ -951,11 +1055,17 @@ class AudioModel(nn.Module):
                 current_mask = current_mask[:, :t_sub]
             else:  # current_mask.shape[1] < t_sub
                 padding_needed = t_sub - current_mask.shape[1]
-                current_mask = mx.pad(current_mask, convert_torch_to_mlx_pad_width((0, padding_needed), current_mask.shape))
+                current_mask = mx.pad(
+                    current_mask,
+                    convert_torch_to_mlx_pad_width(
+                        (0, padding_needed), current_mask.shape
+                    ),
+                )
 
         for i, block in enumerate(self.conformer):
-            audio_encodings = block(audio_encodings, current_mask)  # Pass the processed mask
-
+            audio_encodings = block(
+                audio_encodings, current_mask
+            )  # Pass the processed mask
 
         if self.config.conf_reduction_factor > 1:
             audio_encodings = audio_encodings[:, :: self.config.conf_reduction_factor]
@@ -969,7 +1079,12 @@ class AudioModel(nn.Module):
             mask_current_len = current_mask.shape[1]
             if target_len > mask_current_len:
                 padding_needed = target_len - mask_current_len
-                current_mask = mx.pad(current_mask, convert_torch_to_mlx_pad_width((0, padding_needed), current_mask.shape))
+                current_mask = mx.pad(
+                    current_mask,
+                    convert_torch_to_mlx_pad_width(
+                        (0, padding_needed), current_mask.shape
+                    ),
+                )
             elif mask_current_len > target_len:  # mask is longer
                 current_mask = current_mask[:, :target_len]
 

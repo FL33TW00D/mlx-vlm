@@ -15,9 +15,9 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-import soundfile as sf
-import scipy.signal as signal
 import requests
+import scipy.signal as signal
+import soundfile as sf
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 from PIL import Image, ImageOps
@@ -114,7 +114,9 @@ def get_model_and_args(config: dict):
     return arch, model_type
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -139,7 +141,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None, force_d
                     "*.model",
                     "*.tiktoken",
                     "*.txt",
-                    "*.jinja"
+                    "*.jinja",
                 ],
                 force_download=force_download,
             )
@@ -828,7 +830,10 @@ def load_audio(
         audio = resample_audio(audio, sample_rate, sr)
     return np.array(audio).mean(axis=1)
 
-def process_inputs(processor, images=None, audio=None, prompts=None, return_tensors="mlx"):
+
+def process_inputs(
+    processor, images=None, audio=None, prompts=None, return_tensors="mlx"
+):
     if hasattr(processor, "process"):
         inputs = processor.process(
             text=prompts,
@@ -839,15 +844,25 @@ def process_inputs(processor, images=None, audio=None, prompts=None, return_tens
         )
     else:
         inputs = processor(
-            text=prompts, images=images, audio=audio, padding=True, return_tensors=return_tensors
+            text=prompts,
+            images=images,
+            audio=audio,
+            padding=True,
+            return_tensors=return_tensors,
         )
     return inputs
 
 
-def process_inputs_with_fallback(processor, images, audio, prompts, return_tensors="mlx"):
+def process_inputs_with_fallback(
+    processor, images, audio, prompts, return_tensors="mlx"
+):
     try:
         inputs = process_inputs(
-            processor, images=images, audio=audio, prompts=prompts, return_tensors=return_tensors
+            processor,
+            images=images,
+            audio=audio,
+            prompts=prompts,
+            return_tensors=return_tensors,
         )
     except Exception as e:
         try:
@@ -855,7 +870,13 @@ def process_inputs_with_fallback(processor, images, audio, prompts, return_tenso
                 f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
                 "Trying to process inputs with return_tensors='pt'",
             )
-            inputs = process_inputs(processor, images=images, audio=audio, prompts=prompts, return_tensors="pt")
+            inputs = process_inputs(
+                processor,
+                images=images,
+                audio=audio,
+                prompts=prompts,
+                return_tensors="pt",
+            )
         except Exception as e:
             raise ValueError(
                 f"Failed to process inputs with error: {e}. Please install PyTorch and try again."
@@ -863,7 +884,14 @@ def process_inputs_with_fallback(processor, images, audio, prompts, return_tenso
     return inputs
 
 
-def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token_index=None, resize_shape=None):
+def prepare_inputs(
+    processor,
+    images=None,
+    audio=None,
+    prompts=None,
+    image_token_index=None,
+    resize_shape=None,
+):
     # Process images
     if images is not None:
         if not isinstance(images, list):
@@ -880,11 +908,15 @@ def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token
             audio = [audio]
 
         if len(audio) > 1:
-            print("\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n")
+            print(
+                "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
+            )
             audio = audio[:1]
 
-        audio = [load_audio(audio_file, sr=processor.feature_extractor.sampling_rate) for audio_file in audio]
-
+        audio = [
+            load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
+            for audio_file in audio
+        ]
 
     model_inputs = {}
 
@@ -923,7 +955,9 @@ def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-        inputs = process_inputs_with_fallback(processor, images=images, audio=audio, prompts=prompts)
+        inputs = process_inputs_with_fallback(
+            processor, images=images, audio=audio, prompts=prompts
+        )
 
         if "images" in inputs:
             inputs["pixel_values"] = inputs["images"]
@@ -938,6 +972,7 @@ def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token
                 model_inputs[key] = mx.array(value)
 
     return model_inputs
+
 
 def generate_step(
     input_ids: mx.array,
@@ -1144,7 +1179,7 @@ def stream_generate(
     processor: PreTrainedTokenizer,
     prompt: str,
     image: Union[str, List[str]] = None,
-    audio:  Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -1188,7 +1223,12 @@ def stream_generate(
         mask = kwargs.pop("mask", None)
     else:
         inputs = prepare_inputs(
-            processor, images=image, audio=audio, prompts=prompt, image_token_index=image_token_index, resize_shape=resize_shape
+            processor,
+            images=image,
+            audio=audio,
+            prompts=prompt,
+            image_token_index=image_token_index,
+            resize_shape=resize_shape,
         )
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)

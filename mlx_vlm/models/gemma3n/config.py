@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import inspect
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 
@@ -37,6 +37,7 @@ class AudioConfig:
             }
         )
 
+
 @dataclass
 class VisionConfig:
     model_type: str = "siglip_vision_model"
@@ -59,6 +60,7 @@ class VisionConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
+
 
 @dataclass
 class TextConfig:
@@ -130,5 +132,3 @@ class ModelConfig:
                 if k in inspect.signature(cls).parameters
             }
         )
-
-

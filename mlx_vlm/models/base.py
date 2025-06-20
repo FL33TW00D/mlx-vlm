@@ -33,6 +33,7 @@ def expand2square(pil_img, background_color):
         result.paste(pil_img, ((height - width) // 2, 0))
         return result
 
+
 def check_array_shape(arr):
     shape = arr.shape
 
@@ -47,6 +48,7 @@ def check_array_shape(arr):
         return True
     else:
         return False
+
 
 class BaseImageProcessor(ImageProcessor):
     def __init__(
