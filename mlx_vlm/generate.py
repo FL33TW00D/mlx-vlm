@@ -96,6 +96,11 @@ def parse_arguments():
         action="store_true",
         help="Skip special tokens in the detokenizer.",
     )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Force download the model from Hugging Face.",
+    )
 
     return parser.parse_args()
 

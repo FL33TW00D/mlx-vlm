@@ -114,7 +114,7 @@ def get_model_and_args(config: dict):
     return arch, model_type
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -141,7 +141,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.txt",
                     "*.jinja"
                 ],
-                resume_download=True,
+                force_download=force_download,
             )
         )
     return model_path
@@ -318,7 +318,8 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    force_download = kwargs.get("force_download", False)
+    model_path = get_model_path(path_or_hf_repo, force_download=force_download)
 
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
@@ -878,7 +879,11 @@ def prepare_inputs(processor, images=None, audio=None, prompts=None, image_token
     if audio is not None:
         if not isinstance(audio, list):
             audio = [audio]
-            print(f"{audio=}")
+
+        if len(audio) > 1:
+            print("\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n")
+            audio = audio[:1]
+
         audio = [load_audio(audio_file, sr=processor.feature_extractor.sampling_rate) for audio_file in audio]
 
 
