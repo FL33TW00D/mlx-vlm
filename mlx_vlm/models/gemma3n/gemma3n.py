@@ -8,7 +8,7 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
 from .audio import AudioModel, Gemma3nAudioEmbedder
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig, TextConfig, VisionConfig, AudioConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -221,9 +221,23 @@ class Model(nn.Module):
         with open(path / "config.json", "r") as f:
             config = json.load(f)
 
-        model_config = ModelConfig.from_dict(config)
-        model_config.vision_config = VisionConfig.from_dict(config["vision_config"])
-        model_config.text_config = TextConfig.from_dict(config["text_config"])
+        # Create nested configs first
+        text_config = TextConfig.from_dict(config.get("text_config", {}))
+        vision_config = VisionConfig.from_dict(config.get("vision_config", {}))
+        audio_config = AudioConfig.from_dict(config.get("audio_config", {}))
+
+        # Create model config with the nested configs
+        model_config = ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=audio_config,
+            model_type=config.get("model_type", "gemma3n"),
+            vocab_size=config.get("vocab_size", 257152),
+            audio_token_id=config.get("audio_token_id", 262273),
+            image_token_id=config.get("image_token_id", 262145),
+            audio_soft_tokens_per_image=config.get("audio_soft_tokens_per_image", 188),
+            eos_token_id=config.get("eos_token_id", None)
+        )
 
         model = Model(model_config)
         weight_files = glob.glob(str(path / "*.safetensors"))
