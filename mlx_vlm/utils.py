@@ -838,54 +838,53 @@ def load_audio(
 
 
 def process_inputs(
-    processor, images=None, audio=None, prompts=None, return_tensors="mlx"
+    processor, images=None, audio=None, prompts=None, add_special_tokens=False, return_tensors="mlx"
 ):
-    if hasattr(processor, "process"):
-        inputs = processor.process(
-            text=prompts,
-            images=images,
-            audio=audio,
-            padding=True,
-            return_tensors=return_tensors,
-        )
-    else:
-        inputs = processor(
-            text=prompts,
-            images=images,
-            audio=audio,
-            padding=True,
-            return_tensors=return_tensors,
-        )
-    return inputs
+    process_method = getattr(processor, "process", processor)
+
+    return process_method(
+        text=prompts,
+        images=images,
+        audio=audio,
+        padding=True,
+        add_special_tokens=add_special_tokens,
+        return_tensors=return_tensors,
+    )
 
 
 def process_inputs_with_fallback(
-    processor, images, audio, prompts, return_tensors="mlx"
+    processor, images, audio, prompts, add_special_tokens=False, return_tensors="mlx"
 ):
+    # First attempt with specified return_tensors
     try:
-        inputs = process_inputs(
+        return process_inputs(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
+            add_special_tokens=add_special_tokens,
             return_tensors=return_tensors,
         )
     except Exception as e:
-        try:
-            print(
-                f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}",
-                "Trying to process inputs with return_tensors='pt'",
-            )
-            inputs = process_inputs(
-                processor,
-                images=images,
-                audio=audio,
-                prompts=prompts,
-                return_tensors="pt",
-            )
-        except Exception as e:
-            raise ValueError(f"Failed to process inputs with error: {e}")
-    return inputs
+        # Fallback to PyTorch tensors if MLX fails
+        if return_tensors != "pt":
+            try:
+                print(
+                    f"\033[33mWarning\033[0m: Failed to process inputs with error: {e}. "
+                    "Trying to process inputs with return_tensors='pt'"
+                )
+                return process_inputs(
+                    processor,
+                    images=images,
+                    audio=audio,
+                    prompts=prompts,
+                    add_special_tokens=add_special_tokens,
+                    return_tensors="pt",
+                )
+            except Exception as fallback_error:
+                raise ValueError(f"Failed to process inputs with error: {fallback_error}")
+
+        raise ValueError(f"Failed to process inputs with error: {e}")
 
 
 def prepare_inputs(
@@ -895,6 +894,7 @@ def prepare_inputs(
     prompts=None,
     image_token_index=None,
     resize_shape=None,
+    add_special_tokens=False,
 ):
     # Process images
     if images is not None:
@@ -960,7 +960,7 @@ def prepare_inputs(
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
-            processor, images=images, audio=audio, prompts=prompts
+            processor, images=images, audio=audio, prompts=prompts, add_special_tokens=add_special_tokens
         )
 
         if "images" in inputs:
