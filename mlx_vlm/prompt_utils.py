@@ -209,8 +209,8 @@ def apply_chat_template(
     prompt,
     add_generation_prompt=True,
     return_messages=False,
-    num_images=1,
-    num_audios=1,
+    num_images=0,
+    num_audios=0,
     **kwargs,
 ):
 
