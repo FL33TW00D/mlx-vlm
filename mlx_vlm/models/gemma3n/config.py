@@ -41,7 +41,7 @@ class AudioConfig:
 
 @dataclass
 class VisionConfig:
-    model_type: str = "siglip_vision_model"
+    model_type: str = "gemma3n_vision"
     num_hidden_layers: int = 12
     hidden_size: int = 2048
     intermediate_size: int = 8192
@@ -49,6 +49,7 @@ class VisionConfig:
     patch_size: int = 16
     image_size: int = 224
     num_channels: int = 3
+    rms_norm_eps: float = 1e-6
     vocab_size: int = 128
     rms_norm_eps: float = 1e-6
     vocab_offset: int = 262_144

@@ -953,8 +953,8 @@ class VisionModel(nn.Module):
         return self.timm_model(x, output_hidden_states)
 
     def sanitize(self, weights):
-        sanitized_weights = {}
-        for k, v in weights.items():
+        sanitized_weights = {} 
+        for k, v in sanitized_weights.items():
             # PyTorch conv2d weight: [out_channels, in_channels, kH, kW]
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
             if ("conv" in k and "weight" in k) or ("attn" and "proj.weight") in k:
