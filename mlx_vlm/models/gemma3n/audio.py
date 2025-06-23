@@ -1,11 +1,10 @@
-import inspect
 import math
-from dataclasses import dataclass
+
 from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
+
 
 from ..base import check_array_shape
 from .config import AudioConfig, ModelConfig
