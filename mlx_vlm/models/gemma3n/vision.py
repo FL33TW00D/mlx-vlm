@@ -286,6 +286,99 @@ class ConvNormAct(nn.Module):
         return r
 
 
+def pad_same(
+    x,
+    kernel_size: List[int],
+    stride: List[int],
+    dilation: List[int] = (1, 1),
+    value: float = 0,
+):
+    ih, iw = x.shape[-2:]
+    pad_h = get_same_padding(ih, kernel_size[0], stride[0], dilation[0])
+    pad_w = get_same_padding(iw, kernel_size[1], stride[1], dilation[1])
+
+    # MLX pad format: [(low, high), (low, high), ...] for each axis
+    # Padding order is reversed compared to PyTorch F.pad
+    pad_widths = [
+        (0, 0),  # No padding for batch dimension
+        (0, 0),  # No padding for channel dimension
+        (pad_h // 2, pad_h - pad_h // 2),  # Height padding
+        (pad_w // 2, pad_w - pad_w // 2),  # Width padding
+    ]
+
+    x = mx.pad(x, pad_widths, constant_values=value)
+    return x
+
+
+def get_padding_value(padding, kernel_size, **kwargs) -> Tuple[Tuple, bool]:
+    dynamic = False
+    if isinstance(padding, str):
+        # for any string padding, the padding will be calculated for you, one of three ways
+        padding = padding.lower()
+        if padding == 'same':
+            # TF compatible 'SAME' padding, has a performance and GPU memory allocation impact
+            if is_static_pad(kernel_size, **kwargs):
+                # static case, no extra overhead
+                padding = get_padding(kernel_size, **kwargs)
+            else:
+                # dynamic 'SAME' padding, has runtime/GPU memory overhead
+                padding = 0
+                dynamic = True
+        elif padding == 'valid':
+            # 'VALID' padding, same as padding=0
+            padding = 0
+        else:
+            # Default to PyTorch style 'same'-ish symmetric padding
+            padding = get_padding(kernel_size, **kwargs)
+    return padding, dynamic
+
+
+def get_same_padding(input_size: int, kernel_size: int, stride: int, dilation: int = 1) -> int:
+    """Calculate padding needed for 'same' output size."""
+    effective_kernel_size = dilation * (kernel_size - 1) + 1
+    output_size = (input_size + stride - 1) // stride
+    total_padding = max(0, (output_size - 1) * stride + effective_kernel_size - input_size)
+    return total_padding
+
+
+def get_padding(kernel_size, stride=1, dilation=1, **_):
+    """Get symmetric padding for given kernel size."""
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size, kernel_size]
+    if isinstance(stride, int):
+        stride = [stride, stride]
+    if isinstance(dilation, int):
+        dilation = [dilation, dilation]
+
+    padding = []
+    for k, d in zip(kernel_size, dilation):
+        effective_k = d * (k - 1) + 1
+        pad_total = effective_k - 1
+        padding.append(pad_total // 2)
+    return tuple(padding)
+
+
+def is_static_pad(kernel_size, stride=1, dilation=1, **_):
+    """Check if padding can be calculated statically."""
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size, kernel_size]
+    if isinstance(stride, int):
+        stride = [stride, stride]
+    if isinstance(dilation, int):
+        dilation = [dilation, dilation]
+
+    # Static padding is possible when stride is 1 for all dimensions
+    return all(s == 1 for s in stride)
+
+
+class Conv2dSame(nn.Conv2d):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x: mx.array) -> mx.array:
+        x = pad_same(x, self.kernel_size, self.stride, self.dilation)
+        return mx.conv2d(x, self.weight, self.bias, self.stride, (0, 0), self.dilation, self.groups)
+
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L629
 class EdgeResidual(nn.Module):
     def __init__(
@@ -315,7 +408,7 @@ class EdgeResidual(nn.Module):
         self.has_skip = (in_chs == out_chs and stride == 1) and not noskip
 
         padding = (exp_kernel_size - 1) // 2
-        self.conv_exp = nn.Conv2d(
+        self.conv_exp = Conv2dSame(
             in_chs,
             mid_chs,
             kernel_size=exp_kernel_size,
@@ -344,11 +437,15 @@ class EdgeResidual(nn.Module):
             else nn.Identity()
         )
 
+
     def __call__(self, x: mx.array) -> mx.array:
+        shortcut = x
         x = self.conv_exp(x)
         x = self.bn1(x)
         x = self.conv_pwl(x)
         x = self.bn2(x)
+        if self.has_skip:
+            x = x + shortcut
         return x
 
 
@@ -887,7 +984,7 @@ class VisionModel(nn.Module):
         return self.timm_model(x, output_hidden_states)
 
     def sanitize(self, weights):
-        sanitized_weights = {} 
+        sanitized_weights = {}
         for k, v in weights.items():
             # PyTorch conv2d weight: [out_channels, in_channels, kH, kW]
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
