@@ -23,6 +23,7 @@ def check_array_shape(arr):
     return (out_channels >= kH) and (out_channels >= kW) and (kH == kW)
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/mobilenetv5.py#L24
 class MobileNetV5MultiScaleFusionAdapter(nn.Module):
     """Multi-layer fusion token adapter.
     Attributes:
@@ -119,6 +120,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         return img
 
 
+#https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/layer_scale.py#L22
 class LayerScale2d(nn.Module):
     def __init__(self, dim: int, init_values: float = 1e-5, inplace: bool = False):
         super().__init__()
@@ -143,7 +145,7 @@ def rms_norm2d(
         x = x * weight.reshape(1, -1, 1, 1)
     return x
 
-
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/norm_act.py#L504
 class RMSNormAct2d(nn.RMSNorm):
     def __init__(
         self,
@@ -165,12 +167,8 @@ class RMSNormAct2d(nn.RMSNorm):
         return x
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
 class UniversalInvertedResidual(nn.Module):
-    """
-    Universal Inverted Residual Block
-    https://github.com/rwightman/timm/blob/main/timm/models/_efficientnet_blocks.py#L310
-    """
-
     def __init__(
         self,
         in_chs: int,
@@ -261,6 +259,7 @@ class UniversalInvertedResidual(nn.Module):
         return x
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/conv_bn_act.py#L15
 class ConvNormAct(nn.Module):
     def __init__(
         self,
@@ -287,13 +286,8 @@ class ConvNormAct(nn.Module):
         return r
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L629
 class EdgeResidual(nn.Module):
-    """MLX implementation of EdgeTPU Residual block with expansion convolution followed by pointwise-linear w/ stride.
-
-    Originally introduced in 'EfficientNet-EdgeTPU: Creating Accelerator-Optimized Neural Networks with AutoML'
-    This layer is also called FusedMBConv in the MobileDet, EfficientNet-X, and EfficientNet-V2 papers.
-    """
-
     def __init__(
         self,
         in_chs: int,
@@ -358,15 +352,8 @@ class EdgeResidual(nn.Module):
         return x
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L449
 class MobileAttention(nn.Module):
-    """Mobile Attention Block
-
-    For MobileNetV4 - https://arxiv.org/abs/, referenced from
-    https://github.com/tensorflow/models/blob/d93c7e932de27522b2fa3b115f58d06d6f640537/official/vision/modeling/layers/nn_blocks.py#L1504
-
-    MLX implementation based on PyTorch version
-    """
-
     def __init__(
         self,
         in_chs: int,
@@ -508,9 +495,8 @@ class NamedSequential(nn.Module):
         return x
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/attention2d.py#L82
 class MultiQueryAttention2d(nn.Module):
-    """Multi-query attention module for 2D feature maps"""
-
     def __init__(
         self,
         dim: int,
@@ -756,6 +742,7 @@ def _mmqa(
     return conf
 
 
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/mobilenetv5.py#L596
 def gemma3n_mobilenet_def():
     return [
         # Stage 1: Edge Residuals
