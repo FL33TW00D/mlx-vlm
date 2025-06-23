@@ -9,8 +9,8 @@ from huggingface_hub import snapshot_download
 
 from .audio import AudioModel
 from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
-from .language import LanguageModel
-from .vision import VisionModel, Gemma3nVisionEmbedder
+from .language import LanguageModel, Gemma3nRMSNorm
+from .vision import VisionModel
 
 
 def masked_scatter(input_tensor, mask, source):
@@ -93,12 +93,7 @@ class Model(nn.Module):
 
         # Vision
         self.vision_tower = VisionModel(config.vision_config)
-        self.embed_vision = Gemma3nVisionEmbedder(config.vision_config)
-
-        # # Audio
-        audio_vocab_offset = (
-            config.text_config.vocab_size + config.vision_config.vocab_size
-        )
+        self.embed_vision = Gemma3nMultimodalEmbedder(config.vision_config, text_config=config.text_config)
 
         # Audio
         self.audio_tower = AudioModel(config.audio_config)
@@ -278,6 +273,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
+            # if "vision_tower" not in k and "embed_vision" not in k:
             if k.startswith("model."):
                 sanitized_weights[".".join(k.split(".")[1:])] = v
             else:
