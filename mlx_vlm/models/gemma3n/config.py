@@ -26,6 +26,7 @@ class AudioConfig:
     sscp_conv_eps: float = 1e-3
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
+    vocab_offset: int = 262_144 + 128 # text vocab size + vision vocab size
 
     @classmethod
     def from_dict(cls, params):
@@ -48,8 +49,9 @@ class VisionConfig:
     patch_size: int = 16
     image_size: int = 224
     num_channels: int = 3
-    layer_norm_eps: float = 1e-6
     vocab_size: int = 128
+    rms_norm_eps: float = 1e-6
+    vocab_offset: int = 262_144
 
     @classmethod
     def from_dict(cls, params):
@@ -120,6 +122,7 @@ class ModelConfig:
     image_token_id: int = 262145
     hidden_size: int = 2048
     pad_token_id: int = 0
+    vision_soft_tokens_per_image: int = 256
     audio_soft_tokens_per_image: int = 188
     eos_token_id: Optional[List[int]] = None
 

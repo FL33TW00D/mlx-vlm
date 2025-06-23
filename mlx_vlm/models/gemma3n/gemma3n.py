@@ -7,9 +7,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
-from .audio import AudioModel, Gemma3nAudioEmbedder
+from .audio import AudioModel
 from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
-from .language import LanguageModel
+from .language import LanguageModel, Gemma3nRMSNorm
 from .vision import VisionModel
 
 
@@ -44,6 +44,43 @@ def masked_scatter(input_tensor, mask, source):
     return result_flat.reshape(input_shape)
 
 
+
+class Gemma3nMultimodalEmbedder(nn.Module):
+    """Embeds token ids or soft tokens into language model space."""
+
+    def __init__(self, multimodal_config: ModelConfig, text_config: TextConfig):
+        super().__init__()
+
+        self.multimodal_hidden_size = multimodal_config.hidden_size
+        self.eps = multimodal_config.rms_norm_eps
+        self.vocab_offset = multimodal_config.vocab_offset
+        self.vocab_size = multimodal_config.vocab_size
+        self.text_hidden_size = text_config.hidden_size
+
+        self.embedding = nn.Embedding(self.vocab_size, self.multimodal_hidden_size)
+        self.hard_embedding_norm = Gemma3nRMSNorm(self.multimodal_hidden_size, eps=self.eps, )
+        self.soft_embedding_norm = Gemma3nRMSNorm(self.multimodal_hidden_size, eps=self.eps)
+        self.embedding_projection = nn.Linear(self.multimodal_hidden_size, self.text_hidden_size, bias=False)
+        self.embedding_post_projection_norm = Gemma3nRMSNorm(self.text_hidden_size, eps=self.eps, with_scale=False)
+
+    def __call__(
+        self, input_ids: mx.array = None, inputs_embeds: mx.array = None
+    ) -> mx.array:
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is not None:
+            emb_norm = self.soft_embedding_norm(inputs_embeds)
+        else:
+
+            hard_emb = self.embedding(input_ids - self.vocab_offset)
+            emb_norm = self.hard_embedding_norm(hard_emb)
+
+        emb_norm_proj = self.embedding_projection(emb_norm)
+        return self.embedding_post_projection_norm(emb_norm_proj)
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -52,24 +89,30 @@ class Model(nn.Module):
 
         # Text
         self.language_model = LanguageModel(config.text_config)
+        self.vocab_size = config.text_config.vocab_size
 
         # Vision
-        # self.vision_tower = VisionModel(config.vision_config)
-        # self.embed_vision = Gemma3p5VisionEmbedder(config.vision_config)
+        self.vision_tower = VisionModel(config.vision_config)
+        self.embed_vision = Gemma3nMultimodalEmbedder(config.vision_config, text_config=config.text_config)
 
-        # # Audio
-        audio_vocab_offset = (
-            config.text_config.vocab_size + config.vision_config.vocab_size
-        )
-
+        # Audio
         self.audio_tower = AudioModel(config.audio_config)
-        self.embed_audio = Gemma3nAudioEmbedder(config, vocab_offset=audio_vocab_offset)
+        self.embed_audio = Gemma3nMultimodalEmbedder(config.audio_config, text_config=config.text_config)
 
     def embed(self, input_ids):
         text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
 
         inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
 
+        # Vision
+        vision_embeds = self.embed_vision(input_ids=input_ids)
+        inputs_embeds = mx.where(
+            input_ids[..., None] < self.embed_vision.vocab_offset,
+            inputs_embeds,
+            vision_embeds,
+        )
+
+        # Audio
         audio_embeds = self.embed_audio(input_ids=input_ids)
         inputs_embeds = mx.where(
             input_ids[..., None] < self.embed_audio.vocab_offset,
@@ -91,30 +134,61 @@ class Model(nn.Module):
 
         inputs_embeds = self.embed(input_ids)
 
+        # Ensure no gaps between text, vision, and audio embeddings, in that order
+        assert self.embed_vision.vocab_offset == self.vocab_size
+        assert self.embed_audio.vocab_offset == self.vocab_size + self.embed_vision.vocab_size
+
+
+        # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
+        vision_mask = mx.logical_and(
+            input_ids >= self.embed_vision.vocab_offset, input_ids < self.embed_audio.vocab_offset
+        )
+        vision_tokens = mx.where(vision_mask, input_ids, 0)
+        vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
+        inputs_embeds = mx.where(vision_mask[..., None], vision_embeds_flat, inputs_embeds)
+
+        # Handle audio tokens (>= embed_audio.vocab_offset)
+        audio_mask = input_ids >= self.embed_audio.vocab_offset
+        audio_tokens = mx.where(audio_mask, input_ids, 0)
+        audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
+        inputs_embeds = mx.where(audio_mask[..., None], audio_embeds_flat, inputs_embeds)
+
+
+        if pixel_values is not None:
+            pixel_values = pixel_values.astype(self.language_model.model.embed_tokens.weight.dtype)
+            image_features = self.get_image_features(pixel_values)
+
+            return self.merge_multimodal_and_text(
+                input_ids,
+                inputs_embeds,
+                image_features,
+                self.config.image_token_id,
+                modality="image",
+            )
+
         if input_features is not None:
-            audio_outputs, audio_mask = self.get_audio_features(
+            audio_features, audio_mask = self.get_audio_features(
                 input_features, ~input_features_mask
             )
-            padding_tok = mx.array([[self.config.text_config.pad_token_id]])
-            padding_embs = self.embed_audio(input_ids=padding_tok)
+            audio_padding_tok = self.embed_audio.vocab_offset + self.embed_audio.vocab_size - 1
+            audio_padding_ids = mx.array([[audio_padding_tok]])
+            audio_padding_embs = self.embed_audio(input_ids=audio_padding_ids)
+            audio_features = mx.where(audio_mask[..., None], audio_padding_embs, audio_features)
 
-            audio_outputs = mx.where(audio_mask[..., None], padding_embs, audio_outputs)
-
-            extra_padding_tokens = (
-                self.config.audio_soft_tokens_per_image - audio_outputs.shape[1]
-            )
+            audio_batch_size, audio_seq_len, audio_embed_dim = audio_features.shape
+            extra_padding_tokens = self.config.audio_soft_tokens_per_image - audio_seq_len
             extra_padding_features = mx.broadcast_to(
-                padding_embs,
-                (audio_outputs.shape[0], extra_padding_tokens, padding_embs.shape[2]),
+                audio_padding_embs,
+                (audio_batch_size, extra_padding_tokens, audio_embed_dim),
             )
 
-            audio_outputs = mx.concatenate(
-                (audio_outputs, extra_padding_features), axis=1
+            audio_features = mx.concatenate(
+                (audio_features, extra_padding_features), axis=1
             )
             return self.merge_multimodal_and_text(
                 input_ids,
                 inputs_embeds,
-                audio_outputs,
+                audio_features,
                 self.config.audio_token_id,
                 modality="audio",
             )
@@ -126,8 +200,8 @@ class Model(nn.Module):
         return self.embed_audio(inputs_embeds=audio_outputs), audio_mask
 
     def get_image_features(self, pixel_values):
-        vision_outputs, _, _ = self.vision_tower(
-            pixel_values.transpose(0, 2, 3, 1),
+        vision_outputs = self.vision_tower(
+            pixel_values,
             output_hidden_states=True,
         )
         vision_outputs = vision_outputs.reshape(
@@ -138,7 +212,7 @@ class Model(nn.Module):
 
         # Normalize and embed the soft tokens into language model space.
         vision_outputs *= self.config.vision_config.hidden_size**0.5
-        return self.embed_vision(vision_outputs, is_soft_embedding=True)
+        return self.embed_vision(inputs_embeds=vision_outputs)
 
     def merge_multimodal_and_text(
         self, input_ids, inputs_embeds, features, token_id, modality="image"
@@ -198,11 +272,11 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized_weights = {}
         for k, v in weights.items():
-            if "vision_tower" not in k and "embed_vision" not in k:
-                if k.startswith("model."):
-                    sanitized_weights[".".join(k.split(".")[1:])] = v
-                else:
-                    sanitized_weights[k] = v
+            # if "vision_tower" not in k and "embed_vision" not in k:
+            if k.startswith("model."):
+                sanitized_weights[".".join(k.split(".")[1:])] = v
+            else:
+                sanitized_weights[k] = v
         return sanitized_weights
 
     @staticmethod
