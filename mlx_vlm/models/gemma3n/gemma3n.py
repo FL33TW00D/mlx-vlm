@@ -58,7 +58,7 @@ class Gemma3nMultimodalEmbedder(nn.Module):
         self.text_hidden_size = text_config.hidden_size
 
         self.embedding = nn.Embedding(self.vocab_size, self.multimodal_hidden_size)
-        self.hard_embedding_norm = Gemma3nRMSNorm(self.multimodal_hidden_size, eps=self.eps, )
+        self.hard_embedding_norm = Gemma3nRMSNorm(self.multimodal_hidden_size, eps=self.eps)
         self.soft_embedding_norm = Gemma3nRMSNorm(self.multimodal_hidden_size, eps=self.eps)
         self.embedding_projection = nn.Linear(self.multimodal_hidden_size, self.text_hidden_size, bias=False)
         self.embedding_post_projection_norm = Gemma3nRMSNorm(self.text_hidden_size, eps=self.eps, with_scale=False)
