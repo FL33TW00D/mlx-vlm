@@ -143,15 +143,17 @@ class Model(nn.Module):
         vision_mask = mx.logical_and(
             input_ids >= self.embed_vision.vocab_offset, input_ids < self.embed_audio.vocab_offset
         )
-        vision_tokens = mx.where(vision_mask, input_ids, 0)
-        vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
-        inputs_embeds = mx.where(vision_mask[..., None], vision_embeds_flat, inputs_embeds)
+        if vision_mask.any():
+            vision_tokens = mx.where(vision_mask, input_ids, 0)
+            vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
+            inputs_embeds = mx.where(vision_mask[..., None], vision_embeds_flat, inputs_embeds)
 
         # Handle audio tokens (>= embed_audio.vocab_offset)
         audio_mask = input_ids >= self.embed_audio.vocab_offset
-        audio_tokens = mx.where(audio_mask, input_ids, 0)
-        audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
-        inputs_embeds = mx.where(audio_mask[..., None], audio_embeds_flat, inputs_embeds)
+        if audio_mask.any():
+            audio_tokens = mx.where(audio_mask, input_ids, 0)
+            audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
+            inputs_embeds = mx.where(audio_mask[..., None], audio_embeds_flat, inputs_embeds)
 
 
         if pixel_values is not None:
@@ -219,9 +221,8 @@ class Model(nn.Module):
     ):
 
         if input_ids is None:
-            special_modality_mask = inputs_embeds == self.embed_audio(
-                input_ids=mx.array([self.config.audio_token_id])
-            )
+            embed_fn = self.embed_audio if modality == "audio" else self.embed_vision
+            special_modality_mask = inputs_embeds == embed_fn(input_ids=mx.array([token_id]))
         else:
             special_modality_mask = mx.expand_dims(input_ids == token_id, -1)
             special_modality_mask = mx.broadcast_to(
