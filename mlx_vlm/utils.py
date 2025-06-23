@@ -1396,3 +1396,41 @@ def generate(
     }
 
     return text, usage_stats
+
+def print_array_report(t: mx.array, label: Optional[str]) -> dict:
+    """
+    Return a dictionary report of an MLX array similar to PyTorch's tensor representation.
+    Args:
+        arr: MLX array to analyze
+    Returns:
+        Dictionary containing shape, dtype, value representation, and statistics
+    """
+
+    from pprint import pprint
+
+    # Get basic statistics
+    mean_val = mx.mean(t)
+    std_val = mx.std(t)
+    min_val = mx.min(t)
+    max_val = mx.max(t)
+
+    report = {
+        "shape": f"{tuple(t.shape)}",
+        "dtype": str(t.dtype),
+        "value": repr(t),
+        "mean": f"array({mean_val}, dtype={t.dtype})",
+        "std": f"array({std_val}, dtype={t.dtype})",
+        "min": f"array({min_val}, dtype={t.dtype})",
+        "max": f"array({max_val}, dtype={t.dtype})",
+        "label": label if label else "array",
+    }
+
+    # Print each field, handling 'value' specially
+    print("{")
+    for key, value in report.items():
+        if key == "value":
+            print(f" '{key}': {value},")  # No quotes around value
+        else:
+            print(f" '{key}': {repr(value)},")
+    print("}")
+    return report
