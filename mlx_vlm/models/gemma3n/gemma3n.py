@@ -14,30 +14,35 @@ from .vision import VisionModel
 
 
 def masked_scatter(input_tensor, mask, source):
-    """MLX implementation of PyTorch's masked_scatter - simplified version"""
+    """MLX implementation of PyTorch's masked_scatter"""
+    
+    # Convert mask to boolean once
     mask = mask.astype(mx.bool_)
-    result = mx.broadcast_to(input_tensor, mask.shape).flatten()
+
+    # Early exit
+    if not mask.any():
+        return mx.broadcast_to(input_tensor, mask.shape)
+
+    # Flatten everything once
+    input_shape = mask.shape
+    result_flat = mx.broadcast_to(input_tensor, input_shape).flatten()
     mask_flat = mask.flatten()
     source_flat = source.flatten()
 
-    # Early return if no values to scatter
-    if not mask_flat.any():
-        return result.reshape(mask.shape)
+    # Create selection indices using cumulative sum
+    selection_mask = mx.cumsum(mask_flat.astype(mx.int32)) - 1
 
-    # Create indices for source values using cumsum
-    # This gives us 0, 1, 2, ... for True positions in mask
-    source_indices = mx.cumsum(mask_flat.astype(mx.int32)) - 1
+    # Bound check and create source selection
+    source_len = len(source_flat)
+    bounded_indices = selection_mask % source_len
 
-    # Clamp indices to source bounds
-    source_indices = mx.clip(source_indices, 0, len(source_flat) - 1)
+    # Vectorized selection from source
+    selected_values = source_flat[bounded_indices]
 
-    # Select source values for each position
-    selected_values = source_flat[source_indices]
+    result_flat = mx.where(mask_flat, selected_values, result_flat)
 
-    # Use where to scatter: if mask is True, use source value, else original
-    result = mx.where(mask_flat, selected_values, result)
+    return result_flat.reshape(input_shape)
 
-    return result.reshape(mask.shape)
 
 
 class Model(nn.Module):
@@ -73,7 +78,6 @@ class Model(nn.Module):
             audio_embeds,
         )
         return inputs_embeds
-
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
