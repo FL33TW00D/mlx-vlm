@@ -9,7 +9,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput
-from ..cache import StaticKVCache, SlidingWindowCache
+from ..cache import SlidingWindowCache, StaticKVCache
 from .config import TextConfig
 
 
@@ -108,15 +108,25 @@ def _compute_default_rope_parameters(
         dim = rope_kwargs["dim"]
     elif config is not None:
         base = config.rope_theta
-        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
-        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        partial_rotary_factor = (
+            config.partial_rotary_factor
+            if hasattr(config, "partial_rotary_factor")
+            else 1.0
+        )
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         dim = int(head_dim * partial_rotary_factor)
 
     attention_factor = 1.0  # Unused in this type of RoPE
 
     # Compute the inverse frequencies
-    inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim))
+    inv_freq = 1.0 / (
+        base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim)
+    )
     return inv_freq, attention_factor
+
 
 class Gemma3nRotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig, device=None):

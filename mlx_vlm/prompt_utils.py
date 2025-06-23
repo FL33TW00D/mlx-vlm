@@ -1,10 +1,11 @@
-from functools import partial
-from typing import Dict, List, Any, Union, Optional
 from enum import Enum
+from functools import partial
+from typing import Any, Dict, List, Optional, Union
 
 
 class MessageFormat(Enum):
     """Enum for different message format types."""
+
     LIST_WITH_IMAGE = "list_with_image"
     LIST_WITH_IMAGE_FIRST = "list_with_image_first"
     LIST_WITH_IMAGE_TYPE = "list_with_image_type"
@@ -37,14 +38,12 @@ MODEL_CONFIG = {
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE,
-
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "bunny-llama": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi3_v": MessageFormat.NUMBERED_IMAGE_TOKENS,
     "multi_modality": MessageFormat.IMAGE_TOKEN,
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
-
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
@@ -53,8 +52,12 @@ MODEL_CONFIG = {
 
 # Models that don't support multi-image
 SINGLE_IMAGE_ONLY_MODELS = {
-    "llava_next", "llava-qwen2", "bunny-llama",
-    "paligemma", "multi_modality", "mllama"
+    "llava_next",
+    "llava-qwen2",
+    "bunny-llama",
+    "paligemma",
+    "multi_modality",
+    "mllama",
 }
 
 
@@ -82,7 +85,9 @@ class MessageBuilder:
         return {"type": "audio"}
 
     @staticmethod
-    def video_message(video_path: str, max_pixels: int = 224 * 224, fps: int = 1) -> Dict[str, Any]:
+    def video_message(
+        video_path: str, max_pixels: int = 224 * 224, fps: int = 1
+    ) -> Dict[str, Any]:
         """Create a video message."""
         return {
             "type": "video",
@@ -109,7 +114,7 @@ class MessageFormatter:
         skip_audio_token: bool = False,
         num_images: int = 1,
         num_audios: int = 1,
-        **kwargs
+        **kwargs,
     ) -> Union[str, Dict[str, Any]]:
         """Format a message based on the model type."""
 
@@ -127,22 +132,45 @@ class MessageFormatter:
         # Route to appropriate formatter
         formatter_map = {
             MessageFormat.LIST_WITH_IMAGE: self._format_list_with_image,
-            MessageFormat.LIST_WITH_IMAGE_FIRST: partial(self._format_list_with_image, image_first=True),
+            MessageFormat.LIST_WITH_IMAGE_FIRST: partial(
+                self._format_list_with_image, image_first=True
+            ),
             MessageFormat.LIST_WITH_IMAGE_TYPE: self._format_list_with_image_type,
-            MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT: partial(self._format_list_with_image_type, message_type="text"),
-            MessageFormat.IMAGE_TOKEN: partial(self._format_with_token, token="<image>"),
-            MessageFormat.IMAGE_TOKEN_PIPE: partial(self._format_with_token, token="<|image|>"),
-            MessageFormat.START_IMAGE_TOKEN: partial(self._format_with_token, token="<start_of_image>", image_first=False),
-            MessageFormat.IMAGE_TOKEN_NEWLINE: partial(self._format_with_token, token="<image>\n"),
+            MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT: partial(
+                self._format_list_with_image_type, message_type="text"
+            ),
+            MessageFormat.IMAGE_TOKEN: partial(
+                self._format_with_token, token="<image>"
+            ),
+            MessageFormat.IMAGE_TOKEN_PIPE: partial(
+                self._format_with_token, token="<|image|>"
+            ),
+            MessageFormat.START_IMAGE_TOKEN: partial(
+                self._format_with_token, token="<start_of_image>", image_first=False
+            ),
+            MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
+                self._format_with_token, token="<image>\n"
+            ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
-            MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>" * num_images + prompt,
-            MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: prompt + "<start_of_image>" * num_images,
+            MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
+            * num_images
+            + prompt,
+            MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: prompt
+            + "<start_of_image>" * num_images,
             MessageFormat.VIDEO_WITH_TEXT: self._format_video_message,
         }
 
         formatter = formatter_map.get(self.format_type)
-        return formatter(prompt, role, skip_image_token, skip_audio_token, num_images, num_audios, **kwargs)
+        return formatter(
+            prompt,
+            role,
+            skip_image_token,
+            skip_audio_token,
+            num_images,
+            num_audios,
+            **kwargs,
+        )
 
     def _format_list_with_image(
         self,
@@ -151,7 +179,7 @@ class MessageFormatter:
         skip_image_token: bool,
         num_images: int,
         image_first: bool = False,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Format as a list with image tokens."""
         content = [MessageBuilder.text_message(prompt)]
@@ -171,20 +199,30 @@ class MessageFormatter:
         num_images: int,
         num_audios: int,
         message_type: str = "content",
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Format as a list with typed messages."""
-        msg_func = MessageBuilder.content_message if message_type == "content" else MessageBuilder.text_message
+        msg_func = (
+            MessageBuilder.content_message
+            if message_type == "content"
+            else MessageBuilder.text_message
+        )
         message = {"role": role, "content": [msg_func(prompt)]}
 
         if role == "user":
             if not skip_image_token:
-                message["content"] = [MessageBuilder.image_message()] * num_images + message["content"]
+                message["content"] = [
+                    MessageBuilder.image_message()
+                ] * num_images + message["content"]
             if not skip_audio_token:
-                message["content"] = message["content"] + [MessageBuilder.audio_message()] * num_audios
+                message["content"] = (
+                    message["content"] + [MessageBuilder.audio_message()] * num_audios
+                )
 
         if role == "assistant":
-            message["content"] = message["content"][0].get("content", message["content"][0].get("text"))
+            message["content"] = message["content"][0].get(
+                "content", message["content"][0].get("text")
+            )
 
         return message
 
@@ -196,7 +234,7 @@ class MessageFormatter:
         num_images: int,
         token: str,
         image_first: bool = True,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Any]:
         """Format with image tokens in the text."""
         content = prompt
@@ -208,28 +246,24 @@ class MessageFormatter:
         return {"role": role, "content": content}
 
     def _format_numbered_tokens(
-        self,
-        prompt: str,
-        role: str,
-        skip_image_token: bool,
-        num_images: int,
-        **kwargs
+        self, prompt: str, role: str, skip_image_token: bool, num_images: int, **kwargs
     ) -> Dict[str, Any]:
         """Format with numbered image tokens."""
         content = prompt
 
         if role == "user" and not skip_image_token:
             # phi3_v uses single token regardless of num_images
-            prefix = "<|image_1|>" if self.model_name == "phi3_v" else " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
+            prefix = (
+                "<|image_1|>"
+                if self.model_name == "phi3_v"
+                else " ".join([f"<|image_{i+1}|>" for i in range(num_images)])
+            )
             content = f"{prefix}{content}"
 
         return {"role": role, "content": content}
 
     def _format_video_message(
-        self,
-        prompt: str,
-        role: str = "user",
-        **kwargs
+        self, prompt: str, role: str = "user", **kwargs
     ) -> Dict[str, Any]:
         """Format a video message with text."""
         return {
@@ -238,10 +272,10 @@ class MessageFormatter:
                 MessageBuilder.video_message(
                     kwargs["video"],
                     kwargs.get("max_pixels", 224 * 224),
-                    kwargs.get("fps", 1)
+                    kwargs.get("fps", 1),
                 ),
-                MessageBuilder.text_message(prompt)
-            ]
+                MessageBuilder.text_message(prompt),
+            ],
         }
 
 
@@ -253,7 +287,7 @@ def get_message_json(
     skip_audio_token: bool = False,
     num_images: int = 1,
     num_audios: int = 1,
-    **kwargs
+    **kwargs,
 ) -> Union[str, Dict[str, Any]]:
     """
     Get the appropriate JSON message based on the specified model.
@@ -273,8 +307,13 @@ def get_message_json(
     """
     formatter = MessageFormatter(model_name)
     return formatter.format_message(
-        prompt, role, skip_image_token, skip_audio_token,
-        num_images, num_audios, **kwargs
+        prompt,
+        role,
+        skip_image_token,
+        skip_audio_token,
+        num_images,
+        num_audios,
+        **kwargs,
     )
 
 
@@ -283,20 +322,27 @@ def get_chat_template(
     messages: List[Dict[str, Any]],
     add_generation_prompt: bool,
     tokenize: bool = False,
-    **kwargs
+    **kwargs,
 ) -> Any:
     """Apply chat template using processor's tokenizer."""
     try:
-        processor = processor if hasattr(processor, "apply_chat_template") else processor.tokenizer
+        processor = (
+            processor
+            if hasattr(processor, "apply_chat_template")
+            else processor.tokenizer
+        )
 
         return processor.apply_chat_template(
-            messages, tokenize=tokenize,
-            add_generation_prompt=add_generation_prompt, **kwargs
+            messages,
+            tokenize=tokenize,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
     except AttributeError:
         raise ValueError(
             "Error: processor does not have 'chat_template' or 'tokenizer' attribute."
         )
+
 
 def apply_chat_template(
     processor,
@@ -306,7 +352,7 @@ def apply_chat_template(
     return_messages: bool = False,
     num_images: int = 0,
     num_audios: int = 0,
-    **kwargs
+    **kwargs,
 ) -> Union[List[Dict[str, Any]], str, Any]:
     """
     Apply chat template to prompts.
@@ -332,36 +378,59 @@ def apply_chat_template(
 
     if isinstance(prompt, str):
         # Single string prompt
-        messages.append(get_message_json(
-            model_type, prompt,
-            num_images=num_images, num_audios=num_audios, **kwargs
-        ))
+        messages.append(
+            get_message_json(
+                model_type,
+                prompt,
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
+            )
+        )
     elif isinstance(prompt, dict):
         # Single dict prompt
-        messages.append(get_message_json(
-            model_type, prompt["content"], prompt["role"],
-            num_images=num_images, num_audios=num_audios, **kwargs
-        ))
+        messages.append(
+            get_message_json(
+                model_type,
+                prompt["content"],
+                prompt["role"],
+                num_images=num_images,
+                num_audios=num_audios,
+                **kwargs,
+            )
+        )
     elif isinstance(prompt, list):
         # List of prompts
         for i, p in enumerate(prompt):
             if isinstance(p, str):
                 is_first = i == 0
-                messages.append(get_message_json(
-                    model_type, p,
-                    skip_image_token=not is_first,
-                    skip_audio_token=not is_first,
-                    num_images=num_images, num_audios=num_audios, **kwargs
-                ))
+                messages.append(
+                    get_message_json(
+                        model_type,
+                        p,
+                        skip_image_token=not is_first,
+                        skip_audio_token=not is_first,
+                        num_images=num_images,
+                        num_audios=num_audios,
+                        **kwargs,
+                    )
+                )
             elif isinstance(p, dict):
                 role = p.get("role", "user")
                 is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
-                messages.append(get_message_json(
-                    model_type, p["content"], role,
-                    skip_image_token=not is_first or role in ["system", "assistant"],
-                    skip_audio_token=not is_first or role in ["system", "assistant"],
-                    num_images=num_images, **kwargs
-                ))
+                messages.append(
+                    get_message_json(
+                        model_type,
+                        p["content"],
+                        role,
+                        skip_image_token=not is_first
+                        or role in ["system", "assistant"],
+                        skip_audio_token=not is_first
+                        or role in ["system", "assistant"],
+                        num_images=num_images,
+                        **kwargs,
+                    )
+                )
 
     if return_messages:
         return messages

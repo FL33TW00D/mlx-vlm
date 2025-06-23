@@ -1,10 +1,8 @@
 import math
-
 from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-
 
 from ..base import check_array_shape
 from .config import AudioConfig, ModelConfig

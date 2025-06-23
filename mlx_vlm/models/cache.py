@@ -1,5 +1,6 @@
-import mlx.core as mx
 from typing import Tuple
+
+import mlx.core as mx
 from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache, _BaseCache
 
 
@@ -49,8 +50,6 @@ class SimpleKVCache:
         self.keys = keys
         self.values = values
         self.cache_length += keys.shape[2]
-
-
 
 
 class SlidingWindowCache(_BaseCache):

@@ -327,7 +327,6 @@ def load(
     force_download = kwargs.get("force_download", False)
     model_path = get_model_path(path_or_hf_repo, force_download=force_download)
 
-
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
         # TODO: Support more modules than just language_model
@@ -838,7 +837,12 @@ def load_audio(
 
 
 def process_inputs(
-    processor, images=None, audio=None, prompts=None, add_special_tokens=False, return_tensors="mlx"
+    processor,
+    images=None,
+    audio=None,
+    prompts=None,
+    add_special_tokens=False,
+    return_tensors="mlx",
 ):
     process_method = getattr(processor, "process", processor)
 
@@ -882,7 +886,9 @@ def process_inputs_with_fallback(
                     return_tensors="pt",
                 )
             except Exception as fallback_error:
-                raise ValueError(f"Failed to process inputs with error: {fallback_error}")
+                raise ValueError(
+                    f"Failed to process inputs with error: {fallback_error}"
+                )
 
         raise ValueError(f"Failed to process inputs with error: {e}")
 
@@ -960,7 +966,11 @@ def prepare_inputs(
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
         inputs = process_inputs_with_fallback(
-            processor, images=images, audio=audio, prompts=prompts, add_special_tokens=add_special_tokens
+            processor,
+            images=images,
+            audio=audio,
+            prompts=prompts,
+            add_special_tokens=add_special_tokens,
         )
 
         if "images" in inputs:

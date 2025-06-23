@@ -8,14 +8,14 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
 from .audio import AudioModel, Gemma3nAudioEmbedder
-from .config import ModelConfig, TextConfig, VisionConfig, AudioConfig
+from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
 
 def masked_scatter(input_tensor, mask, source):
     """MLX implementation of PyTorch's masked_scatter"""
-    
+
     # Convert mask to boolean once
     mask = mask.astype(mx.bool_)
 
@@ -42,7 +42,6 @@ def masked_scatter(input_tensor, mask, source):
     result_flat = mx.where(mask_flat, selected_values, result_flat)
 
     return result_flat.reshape(input_shape)
-
 
 
 class Model(nn.Module):
@@ -78,6 +77,7 @@ class Model(nn.Module):
             audio_embeds,
         )
         return inputs_embeds
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
@@ -240,7 +240,7 @@ class Model(nn.Module):
             audio_token_id=config.get("audio_token_id", 262273),
             image_token_id=config.get("image_token_id", 262145),
             audio_soft_tokens_per_image=config.get("audio_soft_tokens_per_image", 188),
-            eos_token_id=config.get("eos_token_id", None)
+            eos_token_id=config.get("eos_token_id", None),
         )
 
         model = Model(model_config)
