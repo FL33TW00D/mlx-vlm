@@ -8,8 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
-from ..base import LanguageModelOutput, create_attention_mask, visualize_attention_mask
-from ..cache import ChunkedKVCache, KVCache, RotatingKVCache
+from ..base import LanguageModelOutput
+from ..cache import StaticKVCache, SlidingWindowCache
 from .config import TextConfig
 
 
@@ -92,6 +92,32 @@ def apply_rotary_pos_emb(
     return (x * cos) + (rotate_half(x) * sin)
 
 
+def _compute_default_rope_parameters(
+    config: Optional[TextConfig] = None,
+    seq_len: Optional[int] = None,
+    **rope_kwargs,
+) -> tuple[mx.array, float]:
+
+    if config is not None and len(rope_kwargs) > 0:
+        raise ValueError(
+            "Unexpected arguments: `**rope_kwargs` and `config` are mutually exclusive in "
+            f"`_compute_default_rope_parameters`, got `rope_kwargs`={rope_kwargs} and `config`={config}"
+        )
+    if len(rope_kwargs) > 0:
+        base = rope_kwargs["base"]
+        dim = rope_kwargs["dim"]
+    elif config is not None:
+        base = config.rope_theta
+        partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.int64).astype(mx.float32) / dim))
+    return inv_freq, attention_factor
+
 class Gemma3nRotaryEmbedding(nn.Module):
     def __init__(self, config: TextConfig, device=None):
         super().__init__()
@@ -107,13 +133,9 @@ class Gemma3nRotaryEmbedding(nn.Module):
 
         self.config = config
 
-        # TODO: This is a hack to get the RoPE parameters just for testing.
-        # Will be removed...
-        from transformers.modeling_rope_utils import _compute_default_rope_parameters
-
         self.rope_init_fn = _compute_default_rope_parameters
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
         self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
 
@@ -919,151 +941,3 @@ class LanguageModel(nn.Module):
                 )
 
         return caches
-
-
-class SlidingWindowCache(_BaseCache):
-    """A sliding window cache for local attention layers."""
-
-    def __init__(self, max_size: int, step: int = 256):
-        self.max_size = max_size
-        self.step = step
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> Tuple[mx.array, mx.array]:
-        B, n_kv_heads, seq_len, k_head_dim = keys.shape
-        v_head_dim = values.shape[-1]
-
-        if self.keys is None:
-            # Initialize cache
-            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
-            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
-            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
-            self.values = mx.zeros(v_shape, dtype=values.dtype)
-
-        # Simple sliding window: keep only the last max_size tokens
-        if self.offset + seq_len <= self.max_size:
-            # Fits within current window
-            start_idx = self.offset
-            end_idx = self.offset + seq_len
-            self.keys[:, :, start_idx:end_idx, :] = keys
-            self.values[:, :, start_idx:end_idx, :] = values
-            self.offset += seq_len
-        else:
-            # Need to slide the window
-            if seq_len < self.max_size:
-                # Shift existing content left
-                shift_amount = min(seq_len, self.max_size - 1)
-                self.keys[:, :, :-shift_amount, :] = self.keys[:, :, shift_amount:, :]
-                self.values[:, :, :-shift_amount, :] = self.values[
-                    :, :, shift_amount:, :
-                ]
-                # Add new tokens at the end
-                self.keys[:, :, -shift_amount:, :] = keys[:, :, -shift_amount:, :]
-                self.values[:, :, -shift_amount:, :] = values[:, :, -shift_amount:, :]
-            else:
-                # New sequence is larger than cache, just keep the last max_size tokens
-                self.keys = keys[:, :, -self.max_size :, :]
-                self.values = values[:, :, -self.max_size :, :]
-            self.offset = self.max_size
-
-        return self.keys, self.values
-
-    @property
-    def state(self):
-        if self.keys is None:
-            return None, None
-        return self.keys, self.values
-
-    @state.setter
-    def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                self.offset = self.max_size
-
-    def get_max_cache_shape(self):
-        return self.max_size
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.max_size, self.step, self.offset)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.max_size, self.step, self.offset = map(int, v)
-
-    def is_trimmable(self):
-        return False
-
-    def trim(self, n):
-        return 0
-
-
-class StaticKVCache(_BaseCache):
-    """A static cache that grows to accommodate all tokens."""
-
-    def __init__(self, max_size: int, step: int = 256):
-        self.max_size = max_size
-        self.step = step
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> Tuple[mx.array, mx.array]:
-        B, n_kv_heads, seq_len, k_head_dim = keys.shape
-        v_head_dim = values.shape[-1]
-
-        # Initialize cache if needed
-        if self.keys is None:
-            k_shape = (B, n_kv_heads, self.max_size, k_head_dim)
-            v_shape = (B, n_kv_heads, self.max_size, v_head_dim)
-            self.keys = mx.zeros(k_shape, dtype=keys.dtype)
-            self.values = mx.zeros(v_shape, dtype=values.dtype)
-
-        # Update cache
-        end_pos = min(self.offset + seq_len, self.max_size)
-        actual_seq_len = end_pos - self.offset
-
-        if actual_seq_len > 0:
-            self.keys[:, :, self.offset : end_pos, :] = keys[:, :, :actual_seq_len, :]
-            self.values[:, :, self.offset : end_pos, :] = values[
-                :, :, :actual_seq_len, :
-            ]
-            self.offset = end_pos
-
-        return self.keys, self.values
-
-    @property
-    def state(self):
-        if self.keys is None:
-            return None, None
-        return self.keys, self.values
-
-    @state.setter
-    def state(self, v):
-        if v is not None and len(v) == 2:
-            self.keys, self.values = v
-            if self.keys is not None:
-                self.offset = self.max_size
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.max_size, self.step, self.offset)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.max_size, self.step, self.offset = map(int, v)
-
-    def is_trimmable(self):
-        return True
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        return n
