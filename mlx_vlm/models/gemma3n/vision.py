@@ -1055,7 +1055,7 @@ class VisionTower(nn.Module):
 
         # MBV5 is constructed of 4 stages, each stage is a group of blocks.
         for block_group in self.blocks:
-            print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
+            # print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
             feat_idx += 1
             for block in block_group:
                 x = block(x)

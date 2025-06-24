@@ -571,6 +571,7 @@ class Gemma3Model(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.vocab_size = config.vocab_size
+        self.vocab_size_per_layer_input = config.vocab_size_per_layer_input
         self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
 
@@ -583,7 +584,7 @@ class Gemma3Model(nn.Module):
         ]
 
         self.embed_tokens_per_layer = Gemma3nTextScaledWordEmbedding(
-            config.vocab_size,
+            config.vocab_size_per_layer_input,
             config.num_hidden_layers * config.hidden_size_per_layer_input,
             embed_scale=config.hidden_size_per_layer_input**0.5,
         )
@@ -828,7 +829,7 @@ class Gemma3Model(nn.Module):
 
     def get_per_layer_inputs(self, input_ids: mx.array) -> mx.array:
         per_layer_inputs_mask = mx.logical_and(
-            input_ids >= 0, input_ids < self.vocab_size
+            input_ids >= 0, input_ids < self.vocab_size_per_layer_input
         )
         tokens = mx.where(per_layer_inputs_mask, input_ids, mx.zeros_like(input_ids))
         result = self.embed_tokens_per_layer(tokens).reshape(

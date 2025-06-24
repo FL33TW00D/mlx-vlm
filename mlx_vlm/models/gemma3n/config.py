@@ -74,7 +74,8 @@ class TextConfig:
     num_attention_heads: int = 2
     head_dim: int = 256
     rms_norm_eps: float = 1.0e-6
-    vocab_size: int = 262144
+    vocab_size: int = 262400
+    vocab_size_per_layer_input: int = 262144
     num_key_value_heads: int = 4
     laurel_rank: int = 64
     frac_shared_layers: float = 0.5

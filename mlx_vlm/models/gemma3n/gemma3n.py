@@ -90,6 +90,7 @@ class Model(nn.Module):
         # Text
         self.language_model = LanguageModel(config.text_config)
         self.vocab_size = config.text_config.vocab_size
+        self.vocab_size_per_layer_input = config.text_config.vocab_size_per_layer_input
 
         # Vision
         self.vision_tower = VisionModel(config.vision_config)
@@ -99,26 +100,7 @@ class Model(nn.Module):
         self.audio_tower = AudioModel(config.audio_config)
         self.embed_audio = Gemma3nMultimodalEmbedder(config.audio_config, text_config=config.text_config)
 
-    def embed(self, input_ids):
-        text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
-        inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
 
-        # Vision
-        vision_embeds = self.embed_vision(input_ids=input_ids)
-        inputs_embeds = mx.where(
-            input_ids[..., None] < self.embed_vision.vocab_offset,
-            inputs_embeds,
-            vision_embeds,
-        )
-
-        # Audio
-        audio_embeds = self.embed_audio(input_ids=input_ids)
-        inputs_embeds = mx.where(
-            input_ids[..., None] < self.embed_audio.vocab_offset,
-            inputs_embeds,
-            audio_embeds,
-        )
-        return inputs_embeds
 
     def get_input_embeddings(
         self,
@@ -129,51 +111,50 @@ class Model(nn.Module):
         **kwargs,
     ):
         if pixel_values is None and input_features is None:
-            return self.embed(input_ids)
+            return self.language_model.model.embed_tokens(input_ids)
 
-        text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
-        inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
+        if input_ids is not None:
+            inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-        # Ensure no gaps between text, vision, and audio embeddings, in that order
-        assert self.embed_vision.vocab_offset == self.vocab_size
-        assert self.embed_audio.vocab_offset == self.vocab_size + self.embed_vision.vocab_size
+            # Ensure no gaps between text, vision, and audio embeddings, in that order
+            assert self.embed_audio.vocab_offset == self.vocab_size - self.embed_audio.vocab_size
+            assert self.embed_vision.vocab_offset == self.vocab_size - self.embed_audio.vocab_size - self.embed_vision.vocab_size
 
-        # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
-        vision_mask = mx.logical_and(
-            input_ids >= self.embed_vision.vocab_offset, input_ids < self.embed_audio.vocab_offset
-        )
-        if vision_mask.any():
-            vision_tokens = mx.where(vision_mask, input_ids, 0)
-            vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
-            inputs_embeds = mx.where(vision_mask[..., None], vision_embeds_flat, inputs_embeds)
+            # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
+            vision_mask = mx.logical_and(
+                input_ids >= self.embed_vision.vocab_offset, input_ids < self.embed_audio.vocab_offset
+            )
+            if vision_mask.any():
+                vision_tokens = mx.where(vision_mask, input_ids, 0)
+                vision_embeds_flat = self.embed_vision(input_ids=vision_tokens)
+                inputs_embeds = mx.where(vision_mask[..., None], vision_embeds_flat, inputs_embeds)
 
-        # Handle audio tokens (>= embed_audio.vocab_offset)
-        audio_mask = input_ids >= self.embed_audio.vocab_offset
-        if audio_mask.any():
-            audio_tokens = mx.where(audio_mask, input_ids, 0)
-            audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
-            inputs_embeds = mx.where(audio_mask[..., None], audio_embeds_flat, inputs_embeds)
+            # Handle audio tokens (>= embed_audio.vocab_offset)
+            audio_mask = input_ids >= self.embed_audio.vocab_offset
+            if audio_mask.any():
+                audio_tokens = mx.where(audio_mask, input_ids, 0)
+                audio_embeds_flat = self.embed_audio(input_ids=audio_tokens)
+                inputs_embeds = mx.where(audio_mask[..., None], audio_embeds_flat, inputs_embeds)
 
-
+        # Vision features
         if pixel_values is not None:
             pixel_values = pixel_values.astype(self.language_model.model.embed_tokens.weight.dtype)
             image_features = self.get_image_features(pixel_values)
 
-            merged_text_and_vision = self.merge_multimodal_and_text(
+            return self.merge_multimodal_and_text(
                 input_ids,
                 inputs_embeds,
                 image_features,
                 self.config.image_token_id,
                 modality="image",
             )
-            return merged_text_and_vision
 
+        # Audio features
         if input_features is not None:
             audio_features, audio_mask = self.get_audio_features(
                 input_features, ~input_features_mask
             )
-            audio_padding_tok = self.embed_audio.vocab_offset + self.embed_audio.vocab_size - 1
-            audio_padding_ids = mx.array([[audio_padding_tok]])
+            audio_padding_ids = mx.array([[self.vocab_size - 1]])
             audio_padding_embs = self.embed_audio(input_ids=audio_padding_ids)
             audio_features = mx.where(audio_mask[..., None], audio_padding_embs, audio_features)
 
