@@ -12,6 +12,8 @@ from mlx_vlm.models.gemma3n.config import VisionConfig
 from mlx_vlm.utils import print_array_report
 
 from .language import Gemma3nRMSNorm
+from ..kimi_vl.vision import bicubic_interpolate
+
 
 def check_array_shape(arr):
     if len(arr.shape) != 4:
@@ -22,6 +24,105 @@ def check_array_shape(arr):
     # Check if out_channels is the largest, and kH and KW are the same
     return (out_channels >= kH) and (out_channels >= kW) and (kH == kW)
 
+
+def get_optimal_threadgroup(width, height):
+    """Get optimal threadgroup size for Metal kernel."""
+    # Simple heuristic for threadgroup sizing
+    if width * height <= 256:
+        return (width, height, 1)
+    elif width <= 16 and height <= 16:
+        return (width, height, 1)
+    else:
+        return (16, 16, 1)
+
+def nearest_interpolate(x, size=None, scale_factor=None):
+    """
+    Nearest neighbor interpolation that exactly matches PyTorch's behavior.
+    """
+    # Get input dimensions
+    batch_size, channels, in_h, in_w = x.shape
+
+    # Calculate output dimensions
+    if size is not None:
+        out_h, out_w = size
+    elif scale_factor is not None:
+        if isinstance(scale_factor, (int, float)):
+            scale_h = scale_w = scale_factor
+        else:
+            scale_h, scale_w = scale_factor
+        out_h, out_w = int(in_h * scale_h), int(in_w * scale_w)
+    else:
+        raise ValueError("Either size or scale_factor must be specified")
+
+    # Create dimensions tensor
+    dims = mx.array([batch_size, channels, in_h, in_w, out_h, out_w], dtype=mx.int32)
+
+    # Reshape input tensor to 1D for kernel processing
+    x_flat = x.reshape(-1)
+    input_dtype = x.dtype
+    if input_dtype != mx.float32:
+        x_flat = x_flat.astype(mx.float32)
+
+    # Metal kernel source that matches PyTorch's coordinate calculation
+    source = """
+        uint x_out = thread_position_in_grid.x;
+        uint y_out = thread_position_in_grid.y;
+        uint bc_idx = thread_position_in_grid.z;
+
+        int batch_size = dims[0];
+        int channels = dims[1];
+        int in_h = dims[2];
+        int in_w = dims[3];
+        int out_h = dims[4];
+        int out_w = dims[5];
+
+        if (x_out >= (uint)out_w || y_out >= (uint)out_h || bc_idx >= (uint)(batch_size * channels))
+            return;
+
+        int c = bc_idx % channels;
+        int b = bc_idx / channels;
+
+        // PyTorch's coordinate calculation for nearest neighbor
+        // This matches: torch.nn.functional.interpolate(..., mode='nearest')
+        float scale_h = float(in_h) / float(out_h);
+        float scale_w = float(in_w) / float(out_w);
+
+        // PyTorch uses floor for nearest neighbor coordinate mapping
+        int y_in = int(floor(float(y_out) * scale_h));
+        int x_in = int(floor(float(x_out) * scale_w));
+
+        // Clamp to bounds
+        y_in = max(0, min(y_in, in_h - 1));
+        x_in = max(0, min(x_in, in_w - 1));
+
+        int input_offset = ((b * channels + c) * in_h + y_in) * in_w + x_in;
+        int output_offset = ((b * channels + c) * out_h + y_out) * out_w + x_out;
+
+        output[output_offset] = input[input_offset];
+    """
+
+    # Create and run kernel
+    kernel = mx.fast.metal_kernel(
+        name="pytorch_nearest_interpolation",
+        input_names=["input", "dims"],
+        output_names=["output"],
+        source=source,
+    )
+
+    threadgroup = (16, 16, 1) if out_w > 16 or out_h > 16 else (out_w, out_h, 1)
+    outputs = kernel(
+        inputs=[x_flat, dims],
+        grid=(out_w, out_h, batch_size * channels),
+        threadgroup=threadgroup,
+        output_shapes=[(batch_size * channels * out_h * out_w,)],
+        output_dtypes=[mx.float32],
+    )
+
+    result = outputs[0].reshape(batch_size, channels, out_h, out_w)
+    if input_dtype != mx.float32:
+        result = result.astype(input_dtype)
+
+    return result
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/mobilenetv5.py#L24
 class MobileNetV5MultiScaleFusionAdapter(nn.Module):
@@ -78,35 +179,27 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
 
-        printable = [i.transpose(0, 3, 1, 2) for i in inputs]
-        # Inputs list of [B, H, W, C] tensors
-        high_resolution = inputs[0].shape[
-            1:-1
-        ]  # Assuming the first input is the highest resolution.
+        inputs = [i.transpose(0, 3, 1, 2) for i in inputs]
+        high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
         resized_inputs = []
+
         for _, img in enumerate(inputs):
-            if any([r < hr for r, hr in zip(img.shape[1:-1], high_resolution)]):
-                scale_factor = (
-                    high_resolution[0] / img.shape[-3],
-                    high_resolution[1] / img.shape[-2],
-                )
-                img = nn.Upsample(scale_factor=scale_factor, mode="nearest")(img)
+            if any([r < hr for r, hr in zip(img.shape[-2:], high_resolution)]):
+                img = nearest_interpolate(img, size=high_resolution)
+
             resized_inputs.append(img)
 
         channel_cat_imgs = mx.concatenate(
-            resized_inputs, axis=-1
+            resized_inputs, axis=1
         )  # Cat on channel dim, must equal self.in_channels
-        img = self.ffn(channel_cat_imgs)
+        img = self.ffn(channel_cat_imgs.swapaxes(1, 3)).swapaxes(1, 3)
 
         if any([ro != rh for ro, rh in zip(high_resolution, self.output_resolution)]):
             if (
-                high_resolution[0] % self.output_resolution[0] != 0
-                or high_resolution[1] % self.output_resolution[1] != 0
+                high_resolution[0] % self.output_resolution[0] != 0 or
+                high_resolution[1] % self.output_resolution[1] != 0
             ):
-                img = nn.Upsample(
-                    scale_factor=self.output_resolution,
-                    mode="linear",
-                )(img)
+                img = bicubic_interpolate(img, self.output_resolution)
             else:
                 h_strides = high_resolution[0] // self.output_resolution[0]
                 w_strides = high_resolution[1] // self.output_resolution[1]
@@ -115,7 +208,8 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
                     kernel_size=(h_strides, w_strides),
                     stride=(h_strides, w_strides),
                 )(img)
-            img = self.norm(img) if self.noskip else img
+
+            img = self.norm(img.transpose(0, 2, 3, 1)) if self.noskip else img
 
         return img
 
@@ -251,11 +345,14 @@ class UniversalInvertedResidual(nn.Module):
             self.layer_scale = nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
+        shortcut = x
         x = self.dw_start(x)
         x = self.pw_exp(x)
         x = self.dw_mid(x)
         x = self.pw_proj(x)
         x = self.layer_scale(x)
+        if self.has_skip:
+            x = x + shortcut
         return x
 
 
@@ -408,7 +505,7 @@ class EdgeResidual(nn.Module):
         self.has_skip = (in_chs == out_chs and stride == 1) and not noskip
 
         padding = (exp_kernel_size - 1) // 2
-        self.conv_exp = Conv2dSame(
+        self.conv_exp = nn.Conv2d(
             in_chs,
             mid_chs,
             kernel_size=exp_kernel_size,
@@ -948,25 +1045,27 @@ class VisionTower(nn.Module):
     def __call__(
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
+        feat_idx = 0
         x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
         x = self.conv_stem(x)
         intermediates = []
         hidden_states = []
 
-        # MBV5 is constructed of 4 stages, each stage is a group of blocks.
-        for stage_idx, block_group in enumerate(self.blocks, start=1):
-            #print_array_report(x.transpose(0,3,1,2), f"stage {stage_idx} input")
+        if feat_idx in self.msfa_indices:
+            intermediates.append(x)
 
+        # MBV5 is constructed of 4 stages, each stage is a group of blocks.
+        for block_group in self.blocks:
+            feat_idx += 1
             for block in block_group:
                 x = block(x)
-                if output_hidden_states:
-                    hidden_states.append(x)
-            if stage_idx in self.msfa_indices:
+
+            if feat_idx in self.msfa_indices:
                 intermediates.append(x)
 
-        output = self.msfa(intermediates)
+        x = self.msfa(intermediates)
 
-        return output
+        return x
 
 
 class VisionModel(nn.Module):
