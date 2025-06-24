@@ -66,7 +66,6 @@ class Gemma3nMultimodalEmbedder(nn.Module):
     def __call__(
         self, input_ids: mx.array = None, inputs_embeds: mx.array = None
     ) -> mx.array:
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -78,7 +77,8 @@ class Gemma3nMultimodalEmbedder(nn.Module):
             emb_norm = self.hard_embedding_norm(hard_emb)
 
         emb_norm_proj = self.embedding_projection(emb_norm)
-        return self.embedding_post_projection_norm(emb_norm_proj)
+        projected =  self.embedding_post_projection_norm(emb_norm_proj)
+        return projected
 
 
 class Model(nn.Module):
@@ -101,7 +101,6 @@ class Model(nn.Module):
 
     def embed(self, input_ids):
         text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
-
         inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
 
         # Vision
@@ -132,12 +131,12 @@ class Model(nn.Module):
         if pixel_values is None and input_features is None:
             return self.embed(input_ids)
 
-        inputs_embeds = self.embed(input_ids)
+        text_input_ids = mx.where(input_ids < self.config.vocab_size, input_ids, 0)
+        inputs_embeds = self.language_model.model.embed_tokens(text_input_ids)
 
         # Ensure no gaps between text, vision, and audio embeddings, in that order
         assert self.embed_vision.vocab_offset == self.vocab_size
         assert self.embed_audio.vocab_offset == self.vocab_size + self.embed_vision.vocab_size
-
 
         # Handle vision tokens (>= embed_vision.vocab_offset and < embed_audio.vocab_offset)
         vision_mask = mx.logical_and(
@@ -160,13 +159,14 @@ class Model(nn.Module):
             pixel_values = pixel_values.astype(self.language_model.model.embed_tokens.weight.dtype)
             image_features = self.get_image_features(pixel_values)
 
-            return self.merge_multimodal_and_text(
+            merged_text_and_vision = self.merge_multimodal_and_text(
                 input_ids,
                 inputs_embeds,
                 image_features,
                 self.config.image_token_id,
                 modality="image",
             )
+            return merged_text_and_vision
 
         if input_features is not None:
             audio_features, audio_mask = self.get_audio_features(
@@ -206,6 +206,7 @@ class Model(nn.Module):
             pixel_values,
             output_hidden_states=True,
         )
+        vision_outputs = vision_outputs.transpose(0, 3, 1, 2)
         vision_outputs = vision_outputs.reshape(
             vision_outputs.shape[0],
             self.config.vision_config.hidden_size,
