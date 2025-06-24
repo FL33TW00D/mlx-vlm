@@ -178,7 +178,6 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         self.norm = norm_layer(self.out_channels, eps=1e-6, apply_act=False)
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
-
         inputs = [i.transpose(0, 3, 1, 2) for i in inputs]
         high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
         resized_inputs = []
@@ -207,9 +206,9 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
                 img = nn.AvgPool2d(
                     kernel_size=(h_strides, w_strides),
                     stride=(h_strides, w_strides),
-                )(img)
+                )(img.swapaxes(1, 3))
 
-            img = self.norm(img.transpose(0, 2, 3, 1)) if self.noskip else img
+            img = self.norm(img) if self.noskip else img
 
         return img
 
@@ -1056,6 +1055,7 @@ class VisionTower(nn.Module):
 
         # MBV5 is constructed of 4 stages, each stage is a group of blocks.
         for block_group in self.blocks:
+            print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
             feat_idx += 1
             for block in block_group:
                 x = block(x)
@@ -1064,7 +1064,6 @@ class VisionTower(nn.Module):
                 intermediates.append(x)
 
         x = self.msfa(intermediates)
-
         return x
 
 
