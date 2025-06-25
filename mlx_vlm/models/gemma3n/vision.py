@@ -7,10 +7,13 @@ from typing import Dict, List, Optional, Tuple, Type
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from .config import VisionConfig
+from mlx_vlm.models.gemma3n.config import VisionConfig
+
+
+
 from .language import Gemma3nRMSNorm
-from ..base import check_array_shape
-from ..kimi_vl.vision import bicubic_interpolate
+
+from ..kernels import nearest_interpolate, bicubic_interpolate
 
 
 def check_array_shape(arr):
@@ -22,105 +25,6 @@ def check_array_shape(arr):
     # Check if out_channels is the largest, and kH and KW are the same
     return (out_channels >= kH) and (out_channels >= kW) and (kH == kW)
 
-
-def get_optimal_threadgroup(width, height):
-    """Get optimal threadgroup size for Metal kernel."""
-    # Simple heuristic for threadgroup sizing
-    if width * height <= 256:
-        return (width, height, 1)
-    elif width <= 16 and height <= 16:
-        return (width, height, 1)
-    else:
-        return (16, 16, 1)
-
-def nearest_interpolate(x, size=None, scale_factor=None):
-    """
-    Nearest neighbor interpolation that exactly matches PyTorch's behavior.
-    """
-    # Get input dimensions
-    batch_size, channels, in_h, in_w = x.shape
-
-    # Calculate output dimensions
-    if size is not None:
-        out_h, out_w = size
-    elif scale_factor is not None:
-        if isinstance(scale_factor, (int, float)):
-            scale_h = scale_w = scale_factor
-        else:
-            scale_h, scale_w = scale_factor
-        out_h, out_w = int(in_h * scale_h), int(in_w * scale_w)
-    else:
-        raise ValueError("Either size or scale_factor must be specified")
-
-    # Create dimensions tensor
-    dims = mx.array([batch_size, channels, in_h, in_w, out_h, out_w], dtype=mx.int32)
-
-    # Reshape input tensor to 1D for kernel processing
-    x_flat = x.reshape(-1)
-    input_dtype = x.dtype
-    if input_dtype != mx.float32:
-        x_flat = x_flat.astype(mx.float32)
-
-    # Metal kernel source that matches PyTorch's coordinate calculation
-    source = """
-        uint x_out = thread_position_in_grid.x;
-        uint y_out = thread_position_in_grid.y;
-        uint bc_idx = thread_position_in_grid.z;
-
-        int batch_size = dims[0];
-        int channels = dims[1];
-        int in_h = dims[2];
-        int in_w = dims[3];
-        int out_h = dims[4];
-        int out_w = dims[5];
-
-        if (x_out >= (uint)out_w || y_out >= (uint)out_h || bc_idx >= (uint)(batch_size * channels))
-            return;
-
-        int c = bc_idx % channels;
-        int b = bc_idx / channels;
-
-        // PyTorch's coordinate calculation for nearest neighbor
-        // This matches: torch.nn.functional.interpolate(..., mode='nearest')
-        float scale_h = float(in_h) / float(out_h);
-        float scale_w = float(in_w) / float(out_w);
-
-        // PyTorch uses floor for nearest neighbor coordinate mapping
-        int y_in = int(floor(float(y_out) * scale_h));
-        int x_in = int(floor(float(x_out) * scale_w));
-
-        // Clamp to bounds
-        y_in = max(0, min(y_in, in_h - 1));
-        x_in = max(0, min(x_in, in_w - 1));
-
-        int input_offset = ((b * channels + c) * in_h + y_in) * in_w + x_in;
-        int output_offset = ((b * channels + c) * out_h + y_out) * out_w + x_out;
-
-        output[output_offset] = input[input_offset];
-    """
-
-    # Create and run kernel
-    kernel = mx.fast.metal_kernel(
-        name="pytorch_nearest_interpolation",
-        input_names=["input", "dims"],
-        output_names=["output"],
-        source=source,
-    )
-
-    threadgroup = (16, 16, 1) if out_w > 16 or out_h > 16 else (out_w, out_h, 1)
-    outputs = kernel(
-        inputs=[x_flat, dims],
-        grid=(out_w, out_h, batch_size * channels),
-        threadgroup=threadgroup,
-        output_shapes=[(batch_size * channels * out_h * out_w,)],
-        output_dtypes=[mx.float32],
-    )
-
-    result = outputs[0].reshape(batch_size, channels, out_h, out_w)
-    if input_dtype != mx.float32:
-        result = result.astype(input_dtype)
-
-    return result
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/mobilenetv5.py#L24
 class MobileNetV5MultiScaleFusionAdapter(nn.Module):
@@ -176,10 +80,9 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         self.norm = norm_layer(self.out_channels, eps=1e-6, apply_act=False)
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
-        inputs = [img.transpose(0, 3, 2, 1) for img in inputs]
+        inputs = [i.transpose(0, 3, 1, 2) for i in inputs]
         high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
         resized_inputs = []
-
 
         for _, img in enumerate(inputs):
             if any([r < hr for r, hr in zip(img.shape[-2:], high_resolution)]):
@@ -190,7 +93,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         channel_cat_imgs = mx.concatenate(
             resized_inputs, axis=1
         )  # Cat on channel dim, must equal self.in_channels
-        img = self.ffn(channel_cat_imgs.transpose(0, 3, 2, 1)).transpose(0, 3, 2, 1)
+        img = self.ffn(channel_cat_imgs.swapaxes(1, 3)).swapaxes(1, 3)
 
         if any([ro != rh for ro, rh in zip(high_resolution, self.output_resolution)]):
             if (
@@ -205,7 +108,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
                 img = nn.AvgPool2d(
                     kernel_size=(h_strides, w_strides),
                     stride=(h_strides, w_strides),
-                )(img.transpose(0, 3, 2, 1))
+                )(img.swapaxes(1, 3))
 
             img = self.norm(img) if self.noskip else img
 
@@ -230,13 +133,12 @@ def rms_norm2d(
     eps: float = 1e-5,
 ):
     assert len(normalized_shape) == 1
-    x = x.transpose(0, 3, 2, 1)
-    v = x ** 2
+    v = mx.power(x, 2)
     v = mx.mean(v, axis=1, keepdims=True)
     x = x * mx.rsqrt(v + eps)
     if weight is not None:
         x = x * weight.reshape(1, -1, 1, 1)
-    return x.transpose(0, 3, 2, 1)
+    return x
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/norm_act.py#L504
 class RMSNormAct2d(nn.RMSNorm):
@@ -253,11 +155,12 @@ class RMSNormAct2d(nn.RMSNorm):
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
+        x = x.transpose(0, 3, 1, 2)  # Convert from NHWC to NCHW
         x = rms_norm2d(x.astype(mx.float32), self.normalized_shape, self.weight.astype(mx.float32), self.eps)
         x = self.drop(x)
         x = self.act(x)
+        x = x.transpose(0, 2, 3, 1)  # Convert back to NHWC
         return x.astype(dtype)
-
 
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
@@ -615,7 +518,7 @@ class MobileAttention(nn.Module):
             self.layer_scale = nn.Identity()
 
         # Drop path for residual connection
-        self.drop_path = nn.Identity() # DropPath(drop_path_rate) if drop_path_rate else nn.Identity()
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate else nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
         shortcut = x
@@ -1045,7 +948,8 @@ class VisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         feat_idx = 0
-        x = self.conv_stem(x.transpose(0, 2, 3, 1))
+        x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
+        x = self.conv_stem(x)
         intermediates = []
         hidden_states = []
 
@@ -1054,6 +958,7 @@ class VisionTower(nn.Module):
 
         # MBV5 is constructed of 4 stages, each stage is a group of blocks.
         for block_group in self.blocks:
+            # print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
             feat_idx += 1
             for block in block_group:
                 x = block(x)
@@ -1086,10 +991,7 @@ class VisionModel(nn.Module):
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
             if ("conv" in k and "weight" in k) or ("attn" and "proj.weight") in k:
                 if len(v.shape) == 4:
-                    if check_array_shape(v):
-                        v = v
-                    else:
-                        v = v.transpose(0, 2, 3, 1)
+                    v = v.transpose(0, 2, 3, 1)
             sanitized_weights[k] = v
 
         return sanitized_weights
