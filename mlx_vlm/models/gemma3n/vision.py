@@ -130,7 +130,6 @@ def rms_norm2d(
     eps: float = 1e-5,
 ):
     assert len(normalized_shape) == 1
-    print("mlx rms norm2d: eps: ", eps, "x.shape: ", x.shape, "weight.shape: ", weight.shape, "x.dtype: ", x.dtype, "weight.dtype: ", weight.dtype)
     dtype = x.dtype
     v = mx.power(x, 2)
     v = mx.mean(v, axis=1, keepdims=True)
