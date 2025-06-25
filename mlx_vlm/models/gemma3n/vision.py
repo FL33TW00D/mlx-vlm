@@ -231,12 +231,13 @@ def rms_norm2d(
     eps: float = 1e-5,
 ):
     assert len(normalized_shape) == 1
-    v = mx.power(x, 2)
+    x = x.transpose(0, 3, 2, 1)
+    v = x ** 2
     v = mx.mean(v, axis=1, keepdims=True)
     x = x * mx.rsqrt(v + eps)
     if weight is not None:
         x = x * weight.reshape(1, -1, 1, 1)
-    return x
+    return x.transpose(0, 3, 2, 1)
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/norm_act.py#L504
 class RMSNormAct2d(nn.RMSNorm):
@@ -252,12 +253,12 @@ class RMSNormAct2d(nn.RMSNorm):
         self.act = nn.GELU() if apply_act else nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x.transpose(0, 3, 1, 2)  # Convert from NHWC to NCHW
-        x = rms_norm2d(x, self.normalized_shape, self.weight, self.eps)
+        dtype = x.dtype
+        x = rms_norm2d(x.astype(mx.float32), self.normalized_shape, self.weight.astype(mx.float32), self.eps)
         x = self.drop(x)
         x = self.act(x)
-        x = x.transpose(0, 2, 3, 1)  # Convert back to NHWC
-        return x
+        return x.astype(dtype)
+
 
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
