@@ -7,11 +7,9 @@ from typing import Dict, List, Optional, Tuple, Type
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_vlm.models.gemma3n.config import VisionConfig
-
-from mlx_vlm.utils import print_array_report
-
+from .config import VisionConfig
 from .language import Gemma3nRMSNorm
+from ..base import check_array_shape
 from ..kimi_vl.vision import bicubic_interpolate
 
 
@@ -178,9 +176,10 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         self.norm = norm_layer(self.out_channels, eps=1e-6, apply_act=False)
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
-
+        inputs = [img.transpose(0, 3, 2, 1) for img in inputs]
         high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
         resized_inputs = []
+
 
         for _, img in enumerate(inputs):
             if any([r < hr for r, hr in zip(img.shape[-2:], high_resolution)]):
@@ -191,7 +190,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         channel_cat_imgs = mx.concatenate(
             resized_inputs, axis=1
         )  # Cat on channel dim, must equal self.in_channels
-        img = self.ffn(channel_cat_imgs.swapaxes(1, 3)).swapaxes(1, 3)
+        img = self.ffn(channel_cat_imgs.transpose(0, 3, 2, 1)).transpose(0, 3, 2, 1)
 
         if any([ro != rh for ro, rh in zip(high_resolution, self.output_resolution)]):
             if (
@@ -206,7 +205,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
                 img = nn.AvgPool2d(
                     kernel_size=(h_strides, w_strides),
                     stride=(h_strides, w_strides),
-                )(img.swapaxes(1, 3))
+                )(img.transpose(0, 3, 2, 1))
 
             img = self.norm(img) if self.noskip else img
 
@@ -1046,7 +1045,7 @@ class VisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         feat_idx = 0
-        x = self.conv_stem(x.transpose(0, 3, 1, 2)).transpose(0, 2, 3, 1)
+        x = self.conv_stem(x.transpose(0, 2, 3, 1))
         intermediates = []
         hidden_states = []
 
@@ -1087,7 +1086,10 @@ class VisionModel(nn.Module):
             # MLX conv2d weight: [out_channels, kH, KW, in_channels]
             if ("conv" in k and "weight" in k) or ("attn" and "proj.weight") in k:
                 if len(v.shape) == 4:
-                    v = v.transpose(0, 2, 3, 1)
+                    if check_array_shape(v):
+                        v = v
+                    else:
+                        v = v.transpose(0, 2, 3, 1)
             sanitized_weights[k] = v
 
         return sanitized_weights

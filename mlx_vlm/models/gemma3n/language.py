@@ -890,8 +890,6 @@ class LanguageModel(nn.Module):
         out = self.lm_head(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
-
-
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
