@@ -92,7 +92,7 @@ def apply_rotary_pos_emb(
 
 
 def _compute_default_rope_parameters(
-    config: Optional[TextConfig] = None
+    config: Optional[TextConfig] = None,
     **rope_kwargs,
 ) -> tuple[mx.array, float]:
 
