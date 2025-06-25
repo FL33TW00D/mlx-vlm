@@ -178,7 +178,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         self.norm = norm_layer(self.out_channels, eps=1e-6, apply_act=False)
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
-        inputs = [i.transpose(0, 3, 1, 2) for i in inputs]
+
         high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
         resized_inputs = []
 
@@ -615,7 +615,7 @@ class MobileAttention(nn.Module):
             self.layer_scale = nn.Identity()
 
         # Drop path for residual connection
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate else nn.Identity()
+        self.drop_path = nn.Identity() # DropPath(drop_path_rate) if drop_path_rate else nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
         shortcut = x
@@ -1045,8 +1045,7 @@ class VisionTower(nn.Module):
         self, x: mx.array, output_hidden_states: Optional[bool] = None
     ) -> mx.array:
         feat_idx = 0
-        x = x.transpose(0, 2, 3, 1)  # Convert from NCHW to NHWC
-        x = self.conv_stem(x)
+        x = self.conv_stem(x.transpose(0, 3, 1, 2)).transpose(0, 2, 3, 1)
         intermediates = []
         hidden_states = []
 
@@ -1055,7 +1054,6 @@ class VisionTower(nn.Module):
 
         # MBV5 is constructed of 4 stages, each stage is a group of blocks.
         for block_group in self.blocks:
-            # print_array_report(x.transpose(0,3,1,2), f"Stage {feat_idx + 1} input")
             feat_idx += 1
             for block in block_group:
                 x = block(x)
