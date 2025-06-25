@@ -83,7 +83,6 @@ def apply_rotary_pos_emb(
     x: mx.array,
     cos: mx.array,
     sin: mx.array,
-    position_ids: Optional[mx.array] = None,
     unsqueeze_dim: int = 1,
 ):
 
@@ -93,8 +92,7 @@ def apply_rotary_pos_emb(
 
 
 def _compute_default_rope_parameters(
-    config: Optional[TextConfig] = None,
-    seq_len: Optional[int] = None,
+    config: Optional[TextConfig] = None
     **rope_kwargs,
 ) -> tuple[mx.array, float]:
 
@@ -874,6 +872,10 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.final_logit_softcapping = config.final_logit_softcapping
 
+        # Store the actual text vocabulary size for masking
+        self.text_vocab_size = config.vocab_size_per_layer_input  # 262144
+
+
     def __call__(
         self,
         inputs: mx.array = None,
@@ -888,6 +890,8 @@ class LanguageModel(nn.Module):
         out = self.lm_head(out)
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
+
+
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):

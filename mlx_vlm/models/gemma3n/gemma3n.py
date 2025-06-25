@@ -203,7 +203,7 @@ class Model(nn.Module):
     ):
 
         if input_ids is None:
-            embed_fn = self.embed_audio if modality == "audio" else self.embed_vision
+            embed_fn = self.embed_audio if modality == "audio" else self.language_model.model.embed_tokens
             special_modality_mask = inputs_embeds == embed_fn(input_ids=mx.array([token_id]))
         else:
             special_modality_mask = mx.expand_dims(input_ids == token_id, -1)

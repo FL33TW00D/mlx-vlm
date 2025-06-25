@@ -51,7 +51,6 @@ class VisionConfig:
     num_channels: int = 3
     rms_norm_eps: float = 1e-6
     vocab_size: int = 128
-    rms_norm_eps: float = 1e-6
     vocab_offset: int = 262_144
 
     @classmethod
