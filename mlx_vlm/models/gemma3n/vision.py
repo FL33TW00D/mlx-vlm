@@ -6,12 +6,9 @@ from typing import Dict, List, Optional, Tuple, Type
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
+
 from mlx_vlm.models.gemma3n.config import VisionConfig
 
-
-
-from .language import Gemma3nRMSNorm
 
 from ..kernels import nearest_interpolate, bicubic_interpolate
 
@@ -133,11 +130,13 @@ def rms_norm2d(
     eps: float = 1e-5,
 ):
     assert len(normalized_shape) == 1
+    print("mlx rms norm2d: eps: ", eps, "x.shape: ", x.shape, "weight.shape: ", weight.shape, "x.dtype: ", x.dtype, "weight.dtype: ", weight.dtype)
+    dtype = x.dtype
     v = mx.power(x, 2)
     v = mx.mean(v, axis=1, keepdims=True)
     x = x * mx.rsqrt(v + eps)
     if weight is not None:
-        x = x * weight.reshape(1, -1, 1, 1)
+        x = x.astype(dtype) * weight.reshape(1, -1, 1, 1)
     return x
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/norm_act.py#L504
@@ -154,13 +153,13 @@ class RMSNormAct2d(nn.RMSNorm):
         self.act = nn.GELU() if apply_act else nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
+
         x = x.transpose(0, 3, 1, 2)  # Convert from NHWC to NCHW
-        x = rms_norm2d(x.astype(mx.float32), self.normalized_shape, self.weight.astype(mx.float32), self.eps)
+        x = rms_norm2d(x, self.normalized_shape, self.weight, self.eps)
         x = self.drop(x)
         x = self.act(x)
         x = x.transpose(0, 2, 3, 1)  # Convert back to NHWC
-        return x.astype(dtype)
+        return x
 
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
@@ -201,6 +200,7 @@ class UniversalInvertedResidual(nn.Module):
                 groups=dw_start_groups,
                 bias=False,
                 apply_act=False,
+                eps=1e-05,
             )
         else:
             self.dw_start = nn.Identity()
@@ -214,6 +214,7 @@ class UniversalInvertedResidual(nn.Module):
             padding=0,
             groups=1,
             bias=False,
+            eps=1e-05,
         )
 
         if dw_kernel_size_mid:
@@ -227,6 +228,7 @@ class UniversalInvertedResidual(nn.Module):
                 dilation=dilation,
                 groups=dw_mid_groups,
                 bias=False,
+                eps=1e-05,
             )
         else:
             self.dw_mid = nn.Identity()
@@ -240,6 +242,7 @@ class UniversalInvertedResidual(nn.Module):
             groups=1,
             bias=False,
             apply_act=False,
+            eps=1e-05,
         )
         if layer_scale_init_value is not None:
             self.layer_scale = LayerScale2d(out_chs, layer_scale_init_value)
@@ -271,13 +274,14 @@ class ConvNormAct(nn.Module):
         groups: int = 1,
         bias: bool = False,
         apply_act: bool = True,
+        eps: float = 1e-6,
     ):
         super().__init__()
         self.out_chs = out_chs
         self.conv = nn.Conv2d(
             in_chs, out_chs, kernel_size, stride, padding, dilation, groups, bias
         )
-        self.bn = RMSNormAct2d(out_chs, eps=1e-6, apply_act=apply_act)
+        self.bn = RMSNormAct2d(out_chs, eps=eps, apply_act=apply_act)
 
     def __call__(self, x: mx.array) -> mx.array:
         c = self.conv(x)
@@ -418,7 +422,7 @@ class EdgeResidual(nn.Module):
             bias=False,
         )
 
-        self.bn1 = norm_layer(mid_chs, eps=1e-6) if norm_layer else nn.Identity()
+        self.bn1 = norm_layer(mid_chs, eps=1e-05) if norm_layer else nn.Identity()
 
         # Point-wise linear projection
         padding_pwl = (pw_kernel_size - 1) // 2
@@ -431,7 +435,7 @@ class EdgeResidual(nn.Module):
         )
 
         self.bn2 = (
-            norm_layer(out_chs, eps=1e-6, apply_act=False)
+            norm_layer(out_chs, eps=1e-05, apply_act=False)
             if norm_layer
             else nn.Identity()
         )
@@ -484,7 +488,7 @@ class MobileAttention(nn.Module):
         # Normalization layer
         self.norm = RMSNormAct2d(
             in_chs,
-            eps=1e-6,
+            eps=1e-05,
             apply_act=False,
         )
         # Determine number of heads if not provided
@@ -518,7 +522,7 @@ class MobileAttention(nn.Module):
             self.layer_scale = nn.Identity()
 
         # Drop path for residual connection
-        self.drop_path = DropPath(drop_path_rate) if drop_path_rate else nn.Identity()
+        self.drop_path = nn.Identity()
 
     def __call__(self, x: mx.array) -> mx.array:
         shortcut = x
@@ -867,6 +871,7 @@ class VisionTower(nn.Module):
             kernel_size=3,
             stride=2,
             padding=1,
+            eps=1e-05,
         )
         msfa_indices = (3, 4)
         msfa_output_resolution = (16, 16)
