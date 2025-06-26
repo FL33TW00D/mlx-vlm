@@ -98,6 +98,7 @@ class TextConfig:
     num_kv_shared_layers: int = 0
     max_position_embeddings: int = 32768
     attn_logit_softcapping: float = 0.0
+    layer_types: List[str] = None
 
     @classmethod
     def from_dict(cls, params):

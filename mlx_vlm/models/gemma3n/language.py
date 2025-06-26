@@ -8,8 +8,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
-from ..base import LanguageModelOutput
-from ..cache import SlidingWindowCache, StaticKVCache
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import RotatingKVCache, KVCache
 from .config import TextConfig
 
 
@@ -165,7 +165,7 @@ class Gemma3nRotaryEmbedding(nn.Module):
 class Gemma3nAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern
+        self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.attn_logit_softcapping = config.attn_logit_softcapping
 
         dim = config.hidden_size
@@ -188,9 +188,12 @@ class Gemma3nAttention(nn.Module):
             dim=config.head_dim, eps=config.rms_norm_eps, with_scale=False
         )
 
+
+
         first_kv_shared_layer_idx = (
             config.num_hidden_layers - config.num_kv_shared_layers
         )
+
         self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx
 
         # Compute the layer index from which shared KV cache values will be retrieved.
@@ -210,6 +213,7 @@ class Gemma3nAttention(nn.Module):
         cache: Optional[Any] = None,
         caches: Optional[List[Any]] = None,
         position_embeddings: Optional[mx.array] = None,
+        cache_position: Optional[mx.array] = None,
     ) -> mx.array:
         input_shape = x.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -225,9 +229,8 @@ class Gemma3nAttention(nn.Module):
         if (
             self.is_kv_shared_layer
             and self.kv_shared_layer_index is not None
-            and caches is not None
             and cache is not None
-            and cache.offset > 0
+
         ):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
@@ -256,7 +259,7 @@ class Gemma3nAttention(nn.Module):
             attn_weights = mx.tanh(attn_weights)
             attn_weights = attn_weights * self.attn_logit_softcapping
         if mask is not None:  # no matter the length, we just slice it
-            causal_mask = mask[:, :, :, : keys.shape[-2]]
+            causal_mask = mask[ :, : keys.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
@@ -478,7 +481,14 @@ class Gemma3nDecoderLayer(nn.Module):
             # For FA2, the mask is 2D and is of shape [bs, processed_tokens] (not [bs, max_cache_len]),
             # thus we must slice from the right (at most `effective_seq_len` elements)
 
-            min_dtype = mx.finfo(mask.dtype).min
+            # Handle boolean mask properly
+            if mask.dtype == mx.bool_:
+                # Convert boolean mask to float mask where True=0.0 (allowed) and False=min_value (masked)
+                min_dtype = mx.finfo(mx.float32).min
+                mask = mx.where(mask, 0.0, min_dtype)
+            else:
+                min_dtype = mx.finfo(mask.dtype).min
+
             sliding_window_mask = mx.tril(
                 mx.ones(mask.shape, dtype=mx.bool_), k=-self.sliding_window
             )
@@ -491,7 +501,7 @@ class Gemma3nDecoderLayer(nn.Module):
             # but without data-dependent slicing (i.e. torch.compile friendly)
             mask_indexes = mx.arange(min(effective_seq_len, mask.shape[-1]))
             mask_indexes += offset
-            mask = mask[:, :, :, mask_indexes.astype(mx.int32)]
+            mask = mask[ :, mask_indexes.astype(mx.int32)]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -511,6 +521,7 @@ class Gemma3nDecoderLayer(nn.Module):
             cache,
             caches,
             position_embeddings,
+            cache_position,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -688,7 +699,7 @@ class Gemma3Model(nn.Module):
         the minimum finite value of `dtype` (ban).
         """
         # ------------------------------------------------------------------ #
-        #  if caller already gave us a 4-D “inverted” mask (Flex, FA2, …) we
+        #  if caller already gave us a 4-D "inverted" mask (Flex, FA2, …) we
         #  trust it and short-circuit.
         # ------------------------------------------------------------------ #
         if attention_mask is not None and attention_mask.ndim == 4:
@@ -768,12 +779,10 @@ class Gemma3Model(nn.Module):
                 past_seen_tokens + h.shape[1],
             )
 
-        causal_mask = self._update_causal_mask(
-            mask,
-            h,
-            cache_position,
-            cache,
-        )
+        if mask is None:
+            j = self.config.sliding_window_pattern
+            full_mask = create_attention_mask(h, cache[j - 1 : j], return_array=True)
+            sliding_window_mask = create_attention_mask(h, cache, return_array=True)
 
         h0 = h
 
@@ -801,9 +810,17 @@ class Gemma3Model(nn.Module):
         ):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
+            is_global = self.config.layer_types[i] == "global_attention"
+
+            local_mask = mask
+            if mask is None and is_global:
+                local_mask = full_mask
+            elif mask is None:
+                local_mask = sliding_window_mask
+
             h = layer(
                 h,
-                causal_mask,
+                local_mask,
                 c,
                 per_layer_input,
                 cache,
@@ -888,8 +905,10 @@ class LanguageModel(nn.Module):
             inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache, **kwargs
         )
         out = self.lm_head(out)
-        out = mx.tanh(out / self.final_logit_softcapping)
-        out = out * self.final_logit_softcapping
+        if self.final_logit_softcapping is not None:
+            out = mx.tanh(out / self.final_logit_softcapping)
+            out = out * self.final_logit_softcapping
+
         return LanguageModelOutput(logits=out)
 
     def sanitize(self, weights):
@@ -931,12 +950,10 @@ class LanguageModel(nn.Module):
         for i in range(self.config.num_hidden_layers):
             # Normal KVcache and RotatingKVCache work,
             # but results are better with StaticKVCache and SlidingWindowCache.
-            if (
-                i % self.config.sliding_window_pattern
-                == self.config.sliding_window_pattern - 1
-            ):
+            if self.config.layer_types[i] == "sliding_attention":
                 caches.append(
-                    StaticKVCache(
+                    RotatingKVCache(
+                        keep=0,
                         max_size=min(
                             self.config.sliding_window,
                             self.config.max_position_embeddings,
@@ -945,12 +962,7 @@ class LanguageModel(nn.Module):
                 )
             else:
                 caches.append(
-                    SlidingWindowCache(
-                        max_size=min(
-                            self.config.sliding_window,
-                            self.config.max_position_embeddings,
-                        ),
-                    )
+                    KVCache()
                 )
 
         return caches
