@@ -1397,6 +1397,7 @@ def generate(
 
     return text, usage_stats
 
+
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     """
     Return a dictionary report of an MLX array similar to PyTorch's tensor representation.

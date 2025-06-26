@@ -9,8 +9,7 @@ import mlx.nn as nn
 
 from mlx_vlm.models.gemma3n.config import VisionConfig
 
-
-from ..kernels import nearest_interpolate, bicubic_interpolate
+from ..kernels import bicubic_interpolate, nearest_interpolate
 
 
 def check_array_shape(arr):
@@ -78,7 +77,9 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
 
     def __call__(self, inputs: list[mx.array]) -> mx.array:
         inputs = [i.transpose(0, 3, 1, 2) for i in inputs]
-        high_resolution = inputs[0].shape[-2:]  # Assuming the first input is the highest resolution.
+        high_resolution = inputs[0].shape[
+            -2:
+        ]  # Assuming the first input is the highest resolution.
         resized_inputs = []
 
         for _, img in enumerate(inputs):
@@ -94,8 +95,8 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
 
         if any([ro != rh for ro, rh in zip(high_resolution, self.output_resolution)]):
             if (
-                high_resolution[0] % self.output_resolution[0] != 0 or
-                high_resolution[1] % self.output_resolution[1] != 0
+                high_resolution[0] % self.output_resolution[0] != 0
+                or high_resolution[1] % self.output_resolution[1] != 0
             ):
                 img = bicubic_interpolate(img, self.output_resolution)
             else:
@@ -112,7 +113,7 @@ class MobileNetV5MultiScaleFusionAdapter(nn.Module):
         return img
 
 
-#https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/layer_scale.py#L22
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/layer_scale.py#L22
 class LayerScale2d(nn.Module):
     def __init__(self, dim: int, init_values: float = 1e-5, inplace: bool = False):
         super().__init__()
@@ -138,6 +139,7 @@ def rms_norm2d(
         x = x.astype(dtype) * weight.reshape(1, -1, 1, 1)
     return x
 
+
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/norm_act.py#L504
 class RMSNormAct2d(nn.RMSNorm):
     def __init__(
@@ -161,7 +163,7 @@ class RMSNormAct2d(nn.RMSNorm):
         return x
 
 
-# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L310
 class UniversalInvertedResidual(nn.Module):
     def __init__(
         self,
@@ -260,7 +262,7 @@ class UniversalInvertedResidual(nn.Module):
         return x
 
 
-# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/conv_bn_act.py#L15
+# https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/layers/conv_bn_act.py#L15
 class ConvNormAct(nn.Module):
     def __init__(
         self,
@@ -317,7 +319,7 @@ def get_padding_value(padding, kernel_size, **kwargs) -> Tuple[Tuple, bool]:
     if isinstance(padding, str):
         # for any string padding, the padding will be calculated for you, one of three ways
         padding = padding.lower()
-        if padding == 'same':
+        if padding == "same":
             # TF compatible 'SAME' padding, has a performance and GPU memory allocation impact
             if is_static_pad(kernel_size, **kwargs):
                 # static case, no extra overhead
@@ -326,7 +328,7 @@ def get_padding_value(padding, kernel_size, **kwargs) -> Tuple[Tuple, bool]:
                 # dynamic 'SAME' padding, has runtime/GPU memory overhead
                 padding = 0
                 dynamic = True
-        elif padding == 'valid':
+        elif padding == "valid":
             # 'VALID' padding, same as padding=0
             padding = 0
         else:
@@ -335,11 +337,15 @@ def get_padding_value(padding, kernel_size, **kwargs) -> Tuple[Tuple, bool]:
     return padding, dynamic
 
 
-def get_same_padding(input_size: int, kernel_size: int, stride: int, dilation: int = 1) -> int:
+def get_same_padding(
+    input_size: int, kernel_size: int, stride: int, dilation: int = 1
+) -> int:
     """Calculate padding needed for 'same' output size."""
     effective_kernel_size = dilation * (kernel_size - 1) + 1
     output_size = (input_size + stride - 1) // stride
-    total_padding = max(0, (output_size - 1) * stride + effective_kernel_size - input_size)
+    total_padding = max(
+        0, (output_size - 1) * stride + effective_kernel_size - input_size
+    )
     return total_padding
 
 
@@ -379,7 +385,10 @@ class Conv2dSame(nn.Conv2d):
 
     def forward(self, x: mx.array) -> mx.array:
         x = pad_same(x, self.kernel_size, self.stride, self.dilation)
-        return mx.conv2d(x, self.weight, self.bias, self.stride, (0, 0), self.dilation, self.groups)
+        return mx.conv2d(
+            x, self.weight, self.bias, self.stride, (0, 0), self.dilation, self.groups
+        )
+
 
 # https://github.com/huggingface/new-model-addition-timm-gemma3p5-non-fork/blob/mobilenet-gemma3n-rw/timm/models/_efficientnet_blocks.py#L629
 class EdgeResidual(nn.Module):
@@ -438,7 +447,6 @@ class EdgeResidual(nn.Module):
             if norm_layer
             else nn.Identity()
         )
-
 
     def __call__(self, x: mx.array) -> mx.array:
         shortcut = x

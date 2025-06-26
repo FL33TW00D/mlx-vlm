@@ -26,7 +26,7 @@ class AudioConfig:
     sscp_conv_eps: float = 1e-3
     rms_norm_eps: float = 1e-6
     gradient_clipping: float = 10000000000.0
-    vocab_offset: int = 262_144 + 128 # text vocab size + vision vocab size
+    vocab_offset: int = 262_144 + 128  # text vocab size + vision vocab size
 
     @classmethod
     def from_dict(cls, params):

@@ -9,7 +9,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import _BaseCache
 
 from ..base import LanguageModelOutput, create_attention_mask
-from ..cache import RotatingKVCache, KVCache
+from ..cache import KVCache, RotatingKVCache
 from .config import TextConfig
 
 
@@ -188,8 +188,6 @@ class Gemma3nAttention(nn.Module):
             dim=config.head_dim, eps=config.rms_norm_eps, with_scale=False
         )
 
-
-
         first_kv_shared_layer_idx = (
             config.num_hidden_layers - config.num_kv_shared_layers
         )
@@ -230,7 +228,6 @@ class Gemma3nAttention(nn.Module):
             self.is_kv_shared_layer
             and self.kv_shared_layer_index is not None
             and cache is not None
-
         ):
             # For shared layers, retrieve KV from the designated cache layer
             shared_cache = caches[self.kv_shared_layer_index]
@@ -259,7 +256,7 @@ class Gemma3nAttention(nn.Module):
             attn_weights = mx.tanh(attn_weights)
             attn_weights = attn_weights * self.attn_logit_softcapping
         if mask is not None:  # no matter the length, we just slice it
-            causal_mask = mask[ :, : keys.shape[-2]]
+            causal_mask = mask[:, : keys.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
@@ -501,7 +498,7 @@ class Gemma3nDecoderLayer(nn.Module):
             # but without data-dependent slicing (i.e. torch.compile friendly)
             mask_indexes = mx.arange(min(effective_seq_len, mask.shape[-1]))
             mask_indexes += offset
-            mask = mask[ :, mask_indexes.astype(mx.int32)]
+            mask = mask[:, mask_indexes.astype(mx.int32)]
 
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -892,7 +889,6 @@ class LanguageModel(nn.Module):
         # Store the actual text vocabulary size for masking
         self.text_vocab_size = config.vocab_size_per_layer_input  # 262144
 
-
     def __call__(
         self,
         inputs: mx.array = None,
@@ -961,8 +957,6 @@ class LanguageModel(nn.Module):
                     )
                 )
             else:
-                caches.append(
-                    KVCache()
-                )
+                caches.append(KVCache())
 
         return caches

@@ -1,5 +1,6 @@
 import mlx.core as mx
 
+
 def nearest_interpolate(x, size=None, scale_factor=None):
     """
     Nearest neighbor interpolation that exactly matches PyTorch's behavior.
@@ -88,7 +89,6 @@ def nearest_interpolate(x, size=None, scale_factor=None):
         result = result.astype(input_dtype)
 
     return result
-
 
 
 def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
@@ -261,7 +261,6 @@ def bicubic_interpolate(x, size=None, scale_factor=None, align_corners=False):
         result = result.astype(input_dtype)
 
     return result
-
 
 
 def get_optimal_threadgroup(out_w, out_h):
