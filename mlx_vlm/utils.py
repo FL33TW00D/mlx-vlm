@@ -829,8 +829,23 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 def load_audio(
     file: str,
     sr: int,
+    timeout: int = 10,
 ):
-    audio, sample_rate = sf.read(file, always_2d=True)
+    """
+    Helper function to load audio from either a URL or file.
+    """
+    if file.startswith(("http://", "https://")):
+        try:
+            response = requests.get(file, stream=True, timeout=timeout)
+            response.raise_for_status()
+            audio, sample_rate = sf.read(BytesIO(response.content), always_2d=True)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load audio from URL: {file} with error {e}"
+            ) from e
+    else:
+        audio, sample_rate = sf.read(file, always_2d=True)
+
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
     return np.array(audio).mean(axis=1)
