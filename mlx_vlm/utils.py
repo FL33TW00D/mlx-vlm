@@ -1223,9 +1223,6 @@ def stream_generate(
         if model.config.model_type in ["gemma3", "gemma3n"]
         else True
     )
-    prompt_tokens = mx.array(
-        tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-    )
 
     resize_shape = kwargs.pop("resize_shape", None)
     image_token_index = getattr(model.config, "image_token_index", None)
@@ -1242,6 +1239,7 @@ def stream_generate(
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
+            add_special_tokens=add_special_tokens,
         )
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
