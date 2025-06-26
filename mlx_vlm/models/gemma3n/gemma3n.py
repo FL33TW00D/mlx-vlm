@@ -245,10 +245,12 @@ class Model(nn.Module):
             **kwargs,
         )
 
+        per_layer_inputs = self.language_model.model.get_per_layer_inputs(input_ids)
         logits = self.language_model(
             input_ids=None,
             cache=cache,
             inputs_embeds=inputs_embeds,
+            per_layer_inputs = per_layer_inputs
         )
         return logits
 
